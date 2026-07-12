@@ -1,333 +1,402 @@
-"""Main game loop for Fox in the Forest LLM benchmark."""
+"""Round-robin tournament for Fox in the Forest LLM benchmark.
+
+Defines a set of LLM models and runs a full round-robin tournament where each
+pair of models plays k games. Supports:
+- Fixed random seeds for reproducibility (seed derived from matchup + game index)
+- Resume from previous runs (skips already-completed matches found in results/)
+- Parallel execution via concurrent.futures
+"""
 
 import argparse
 import json
 import os
-from datetime import datetime, timezone
-from typing import Optional
-from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from itertools import combinations
+from typing import List, Dict, Optional
 
-from cards import Card
-from game import GameEngine
-from llm_player import LLMPlayer
+from tqdm import tqdm
 
+from fitf_bench import GameRunner, LLMPlayer
 
-MAX_RETRIES = 3
+GAMES_PER_PAIR = 5
+TARGET_SCORE = 21
+MAX_WORKERS = 8
+RESULTS_DIR = "results"
+LOGS_DIR = "logs"
 
+MODELS: List[Dict[str, str]] = [
+    {
+        "name": "DS-V4-Pro-Thinking",
+        "model": "deepseek-v4-pro",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+        "extra_api_params": {"extra_body": {"thinking": {"type": "enabled"}}},
+    },
+    {
+        "name": "DS-V4-Pro-NonThinking",
+        "model": "deepseek-v4-pro",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+        "extra_api_params": {"extra_body": {"thinking": {"type": "disabled"}}},
+    },
+    {
+        "name": "DS-V4-Flash-Thinking",
+        "model": "deepseek-v4-flash",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+        "extra_api_params": {"extra_body": {"thinking": {"type": "enabled"}}},
+    },
+    {
+        "name": "DS-V4-Flash-NonThinking",
+        "model": "deepseek-v4-flash",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+        "extra_api_params": {"extra_body": {"thinking": {"type": "disabled"}}},
+    },
+    {
+        "name": "GLM-5.2-Max",
+        "model": "zai/glm-5.2",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+    },
+    {
+        "name": "GPT-5.6-Terra",
+        "model": "openai/gpt-5.6-terra",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+        "extra_api_params": {"extra_body": {"reasoning_effort": "high"}},
+    },
+    {
+        "name": "GPT-5.6-Sol",
+        "model": "openai/gpt-5.6-sol",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+        "extra_api_params": {"extra_body": {"reasoning_effort": "high"}},
+    },
+    # {
+    #     "name": "Claude-Fable-5",
+    #     "model": "anthropic/claude-fable-5",
+    #     "api_base": os.environ.get("API_BASE"),
+    #     "api_key": os.environ.get("API_KEY"),
+    # },
+    # {
+    #     "name": "Claude-Sonnet-5",
+    #     "model": "anthropic/claude-sonnet-5",
+    #     "api_base": os.environ.get("API_BASE"),
+    #     "api_key": os.environ.get("API_KEY"),
+    # },
+]
 
-def load_rules() -> str:
-    rules_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RULES.md")
-    with open(rules_path, "r", encoding="utf-8") as f:
-        return f.read()
+# ===========================================================================
+# MATCH ID AND RESUME LOGIC
+# ===========================================================================
 
-
-class GameRunner:
-    """Orchestrates the game between two LLM players."""
-
-    def __init__(self, player1: LLMPlayer, player2: LLMPlayer, target_score: int = 21, verbose: bool = True):
-        self.players = [player1, player2]
-        self.engine = GameEngine(target_score=target_score)
-        self.verbose = verbose
-        self.forfeit_winner: Optional[int] = None
-
-    def log(self, msg: str):
-        if self.verbose:
-            print(msg)
-
-    def broadcast_log(self, msg: str):
-        for p in self.players:
-            p.add_log(msg)
-
-    def run_game(self) -> dict:
-        rules = load_rules()
-        for p in self.players:
-            p.reset_for_new_game()
-            p.send_rules(rules)
-
-        while not self.engine.game_over:
-            self.run_round()
-            if self.forfeit_winner is not None:
-                break
-
-        if self.forfeit_winner is not None:
-            winner = self.forfeit_winner
-            reason = "forfeit"
-        elif self.engine.winner is not None:
-            winner = self.engine.winner
-            reason = "score"
-        else:
-            winner = None
-            reason = "tie"
-
-        self.log("\n" + "=" * 60)
-        self.log("  GAME OVER")
-        self.log(f"  Final scores: {self.players[0].player_name}: {self.engine.scores[0]}, "
-                 f"{self.players[1].player_name}: {self.engine.scores[1]}")
-        if winner is not None:
-            self.log(f"  Winner: {self.players[winner].player_name} ({reason})")
-        else:
-            self.log("  Result: TIE")
-
-        return {
-            "winner": winner,
-            "reason": reason,
-            "scores": self.engine.scores.copy(),
-            "rounds_played": self.engine.round_number,
-            "player_names": [p.player_name for p in self.players],
-        }
-
-    def run_round(self):
-        rs = self.engine.start_new_round()
-
-        round_start_msg = (
-            f"\n{'='*50}\n"
-            f"ROUND {rs.round_number} BEGINS\n"
-            f"Dealer: {self.players[rs.dealer].player_name}\n"
-            f"Decree card: {rs.decree_card} (Trump suit: {rs.trump_suit.value})\n"
-            f"{'='*50}"
-        )
-        self.log(round_start_msg)
-        self.broadcast_log(round_start_msg)
-
-        while not self.engine.is_round_over():
-            if self.forfeit_winner is not None:
-                return
-            self.run_trick()
-
-        _, _, details = self.engine.score_round()
-
-        score_msg = (
-            f"\n--- Round {rs.round_number} Scoring ---\n"
-            f"  {self.players[0].player_name}: {details['tricks_won'][0]} tricks -> "
-            f"{details['base_points'][0]} base + {details['bonus_points'][0]} bonus = {details['round_points'][0]} points\n"
-            f"  {self.players[1].player_name}: {details['tricks_won'][1]} tricks -> "
-            f"{details['base_points'][1]} base + {details['bonus_points'][1]} bonus = {details['round_points'][1]} points\n"
-            f"  Total scores: {self.players[0].player_name}: {details['total_scores'][0]}, "
-            f"{self.players[1].player_name}: {details['total_scores'][1]}"
-        )
-        self.log(score_msg)
-        self.broadcast_log(score_msg)
-
-    def run_trick(self):
-        rs = self.engine.current_round
-        leader = rs.current_leader
-        follower = 1 - leader
-
-        trick_num = rs.trick_number
-        self.log(f"\n--- Trick {trick_num} ---")
-
-        lead_card = self._get_play(leader, is_lead=True)
-        if lead_card is None:
-            return
-
-        events = self.engine.play_lead_card(leader, lead_card)
-        lead_msg = f"  {self.players[leader].player_name} leads: {lead_card}"
-        self.log(lead_msg)
-
-        self._emit_events(events)
-        self.broadcast_log(f"[Trick {trick_num}] {self.players[leader].player_name} leads: {lead_card}")
-        for event in events:
-            self.broadcast_log(f"  * {event}")
-
-        if not self._handle_pending_abilities(leader):
-            return
-
-        follow_card = self._get_play(follower, is_lead=False, lead_card=lead_card)
-        if follow_card is None:
-            return
-
-        events = self.engine.play_follow_card(follower, follow_card)
-        follow_msg = f"  {self.players[follower].player_name} follows: {follow_card}"
-        self.log(follow_msg)
-
-        self._emit_events(events)
-        self.broadcast_log(f"  {self.players[follower].player_name} follows: {follow_card}")
-        for event in events:
-            self.broadcast_log(f"  * {event}")
-
-        if not self._handle_pending_abilities(follower):
-            return
-
-        result = self.engine.resolve_trick()
-        winner_msg = f"  Winner: {self.players[result.winner].player_name}"
-        self.log(winner_msg)
-        self._emit_events(result.events)
-
-        self.broadcast_log(f"  Winner: {self.players[result.winner].player_name}")
-        for event in result.events:
-            self.broadcast_log(f"  * {event}")
-
-        rs = self.engine.current_round
-        tricks_msg = (f"  Tricks so far - {self.players[0].player_name}: {rs.tricks_won[0]}, "
-                     f"{self.players[1].player_name}: {rs.tricks_won[1]}")
-        self.log(tricks_msg)
-        self.broadcast_log(tricks_msg)
-
-    def _emit_events(self, events, broadcast: bool = False):
-        for event in events:
-            message = f"  * {event}"
-            self.log(message)
-            if broadcast:
-                self.broadcast_log(message)
-
-    def _handle_pending_abilities(self, player: int) -> bool:
-        rs = self.engine.current_round
-        if rs.pending_fox_swap and rs.fox_player == player:
-            self._handle_fox_swap(player)
-            if self.forfeit_winner is not None:
-                return False
-        if rs.pending_woodcutter and rs.woodcutter_player == player:
-            self._handle_woodcutter_discard(player)
-        return self.forfeit_winner is None
-
-    def _get_play(self, player: int, is_lead: bool, lead_card: Optional[Card] = None) -> Optional[Card]:
-        legal_cards = self.engine.get_legal_plays(player, lead_card if not is_lead else None)
-
-        if len(legal_cards) == 1:
-            card = legal_cards[0]
-            auto_msg = f"  (Auto-play: {self.players[player].player_name} plays {card})"
-            self.log(auto_msg)
-            self.players[player].notify_forced_play(
-                f"[Auto-play] You have only one legal play: {card}. It is played automatically."
-            )
-            return card
-
-        state_info = self.engine.format_game_state(player)
-
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player].inject_retry_error(error)
-            card, error = self.players[player].request_play_card(
-                state_info if attempt == 0 else None, legal_cards
-            )
-
-            if card is not None:
-                return card
-
-            self.log(f"  [ERROR] {self.players[player].player_name} attempt {attempt+1}/{MAX_RETRIES}: {error}")
-
-        self.log(f"  [FORFEIT] {self.players[player].player_name} failed to make a legal play after {MAX_RETRIES} attempts.")
-        self.forfeit_winner = 1 - player
-        return None
-
-    def _handle_fox_swap(self, player: int):
-        rs = self.engine.current_round
-        legal_cards = self.engine.get_legal_plays_for_fox_swap(player)
-
-        if not legal_cards:
-            events = self.engine.resolve_fox_swap(player, None)
-            self._emit_events(events, broadcast=True)
-            return
-
-        state_info = self.engine.format_game_state(player)
-
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player].inject_retry_error(error)
-            card, skipped, error = self.players[player].request_fox_swap(
-                state_info if attempt == 0 else None, legal_cards, rs.decree_card
-            )
-
-            if skipped:
-                events = self.engine.resolve_fox_swap(player, None)
-                self._emit_events(events, broadcast=True)
-                return
-            if card is not None:
-                events = self.engine.resolve_fox_swap(player, card)
-                self._emit_events(events, broadcast=True)
-                return
-
-            self.log(f"  [ERROR] {self.players[player].player_name} fox_swap attempt {attempt+1}/{MAX_RETRIES}: {error}")
-
-        self.log(f"  [FORFEIT] {self.players[player].player_name} failed fox_swap after {MAX_RETRIES} attempts.")
-        self.forfeit_winner = 1 - player
-
-    def _handle_woodcutter_discard(self, player: int):
-        rs = self.engine.current_round
-        legal_cards = self.engine.get_legal_plays_for_woodcutter_discard(player)
-        drawn_card = rs.woodcutter_drawn_card
-
-        if len(legal_cards) == 1:
-            card = legal_cards[0]
-            events = self.engine.resolve_woodcutter_discard(player, card)
-            self.log(f"  (Auto-discard: {self.players[player].player_name} discards {card})")
-            self.players[player].notify_forced_play(
-                f"[Auto-discard] You have only one card. {card} is discarded automatically."
-            )
-            self._emit_events(events, broadcast=True)
-            return
-
-        state_info = self.engine.format_game_state(player)
-
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player].inject_retry_error(error)
-            card, error = self.players[player].request_woodcutter_discard(
-                state_info if attempt == 0 else None, legal_cards, drawn_card
-            )
-
-            if card is not None:
-                events = self.engine.resolve_woodcutter_discard(player, card)
-                self._emit_events(events, broadcast=True)
-                return
-
-            self.log(f"  [ERROR] {self.players[player].player_name} woodcutter attempt {attempt+1}/{MAX_RETRIES}: {error}")
-
-        self.log(f"  [FORFEIT] {self.players[player].player_name} failed woodcutter_discard after {MAX_RETRIES} attempts.")
-        self.forfeit_winner = 1 - player
+def make_match_id(model_a_name: str, model_b_name: str, game_index: int) -> str:
+    """Create a deterministic match ID from the two model names and game index.
+    
+    The match ID is independent of player order (alphabetically sorted names),
+    so A-vs-B game 1 and B-vs-A game 1 produce the same ID.
+    """
+    names = sorted([model_a_name, model_b_name])
+    return f"{names[0]}_vs_{names[1]}_game{game_index}"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Fox in the Forest - LLM Benchmark")
-    parser.add_argument("--api-base-1", type=str, required=True, help="API base URL for player 1")
-    parser.add_argument("--api-key-1", type=str, default="sk-placeholder", help="API key for player 1")
-    parser.add_argument("--model-1", type=str, required=True, help="Model name for player 1")
-    parser.add_argument("--name-1", type=str, default="Player 1", help="Display name for player 1")
-    parser.add_argument("--api-base-2", type=str, required=True, help="API base URL for player 2")
-    parser.add_argument("--api-key-2", type=str, default="sk-placeholder", help="API key for player 2")
-    parser.add_argument("--model-2", type=str, required=True, help="Model name for player 2")
-    parser.add_argument("--name-2", type=str, default="Player 2", help="Display name for player 2")
-    parser.add_argument("--target-score", type=int, default=21, help="Target score to end game")
-    parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
-    parser.add_argument("--output", type=str, help="Output result JSON path (default: results/<run-id>.json)")
-    parser.add_argument("--log", type=str, help="LLM request/response JSONL path (default: logs/<run-id>.jsonl)")
+def get_completed_matches(results_dir: str) -> set:
+    """Scan results directory and return set of completed match IDs."""
+    completed = set()
+    if not os.path.isdir(results_dir):
+        return completed
+    for filename in os.listdir(results_dir):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(results_dir, filename)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            match_id = data.get("match_id")
+            if match_id:
+                completed.add(match_id)
+        except (json.JSONDecodeError, OSError):
+            continue
+    return completed
 
-    args = parser.parse_args()
 
-    run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
-    output_path = args.output or os.path.join(os.getcwd(), "results", f"{run_id}.json")
-    log_path = args.log or os.path.join(os.getcwd(), "logs", f"{run_id}.jsonl")
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    log_dir = os.path.dirname(os.path.abspath(log_path))
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
+# ===========================================================================
+# SINGLE MATCH EXECUTION
+# ===========================================================================
+
+@dataclass
+class MatchTask:
+    """Describes a single match to be played."""
+    model_a: Dict[str, str]
+    model_b: Dict[str, str]
+    game_index: int
+    match_id: str
+    seed: int
+
+
+def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
+                     target_score: int, verbose: bool) -> Optional[Dict]:
+    """Run a single match between two models. Returns result dict or None on error."""
+    result_path = os.path.join(results_dir, f"{task.match_id}.json")
+    log_path = os.path.join(logs_dir, f"{task.match_id}.jsonl")
 
     player1 = LLMPlayer(
         player_id=0,
-        api_base=args.api_base_1,
-        api_key=args.api_key_1,
-        model=args.model_1,
-        player_name=args.name_1,
+        api_base=task.model_a["api_base"],
+        api_key=task.model_a["api_key"],
+        model=task.model_a["model"],
+        player_name=task.model_a["name"],
         log_path=log_path,
+        extra_api_params=task.model_a.get("extra_api_params"),
     )
     player2 = LLMPlayer(
         player_id=1,
-        api_base=args.api_base_2,
-        api_key=args.api_key_2,
-        model=args.model_2,
-        player_name=args.name_2,
+        api_base=task.model_b["api_base"],
+        api_key=task.model_b["api_key"],
+        model=task.model_b["model"],
+        player_name=task.model_b["name"],
         log_path=log_path,
+        extra_api_params=task.model_b.get("extra_api_params"),
     )
 
-    runner = GameRunner(player1, player2, target_score=args.target_score, verbose=not args.quiet)
-    result = runner.run_game()
+    runner = GameRunner(
+        player1, player2,
+        target_score=target_score,
+        verbose=verbose,
+        seed=task.seed,
+    )
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    try:
+        result = runner.run_game()
+    except Exception as e:
+        print(f"[ERROR] Match {task.match_id} failed with exception: {e}")
+        return None
+
+    if result.get("reason") == "forfeit":
+        winner_name = result["player_names"][result["winner"]]
+        print(f"[FORFEIT] {task.match_id}: {winner_name} by forfeit (not recorded)")
+        return None
+
+    # Enrich result with tournament metadata
+    result["match_id"] = task.match_id
+    result["seed"] = task.seed
+    result["game_index"] = task.game_index
+    result["model_a"] = task.model_a["name"]
+    result["model_b"] = task.model_b["name"]
+
+    # Write result
+    with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
-    print(f"\nResult saved to: {output_path}")
-    print(f"LLM log saved to: {log_path}")
+
+    winner_name = result["player_names"][result["winner"]]
+    print(f"[DONE] {task.match_id}: {winner_name} wins "
+          f"({result['scores'][0]}-{result['scores'][1]}, {result['reason']})")
 
     return result
+
+
+# ===========================================================================
+# TOURNAMENT ORCHESTRATION
+# ===========================================================================
+
+def build_match_schedule(models: List[Dict[str, str]], games_per_pair: int,
+                         completed: set) -> List[MatchTask]:
+    """Build list of matches to run, skipping already-completed ones.
+    
+    For each pair (A, B), we play `games_per_pair` games. In even-indexed games
+    (0, 2, 4, ...) model_a is player 1; in odd-indexed games (1, 3, 5, ...)
+    model_b is player 1. This ensures each model gets roughly equal first-player
+    opportunities (though actual first move is determined by the seed/RNG).
+    """
+    tasks = []
+    for model_a, model_b in combinations(models, 2):
+        for game_idx in range(games_per_pair):
+            match_id = make_match_id(model_a["name"], model_b["name"], game_idx)
+            if match_id in completed:
+                continue
+            seed = str(game_idx)
+            # Alternate who is player 1 vs player 2
+            if game_idx % 2 == 0:
+                p1, p2 = model_a, model_b
+            else:
+                p1, p2 = model_b, model_a
+            tasks.append(MatchTask(
+                model_a=p1,
+                model_b=p2,
+                game_index=game_idx,
+                match_id=match_id,
+                seed=seed,
+            ))
+    return tasks
+
+
+def print_summary(results_dir: str, models: List[Dict[str, str]]):
+    """Print a summary table of all completed results."""
+    # Collect all results
+    all_results = []
+    if os.path.isdir(results_dir):
+        for filename in os.listdir(results_dir):
+            if not filename.endswith(".json"):
+                continue
+            filepath = os.path.join(results_dir, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    all_results.append(json.load(f))
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    if not all_results:
+        print("\nNo results found.")
+        return
+
+    # Build stats per model
+    model_names = [m["name"] for m in models]
+    stats = {name: {"wins": 0, "losses": 0, "forfeits_won": 0,
+                    "total_score": 0, "games": 0}
+             for name in model_names}
+
+    for r in all_results:
+        names = r.get("player_names", [])
+        winner = r.get("winner")
+        reason = r.get("reason", "")
+        scores = r.get("scores", [0, 0])
+
+        for i, name in enumerate(names):
+            if name not in stats:
+                continue
+            stats[name]["games"] += 1
+            stats[name]["total_score"] += scores[i]
+            if winner == i:
+                stats[name]["wins"] += 1
+                if reason == "forfeit":
+                    stats[name]["forfeits_won"] += 1
+            else:
+                stats[name]["losses"] += 1
+
+    # Print table
+    print("\n" + "=" * 70)
+    print("  TOURNAMENT SUMMARY")
+    print("=" * 70)
+    print(f"  {'Model':<25} {'Games':>6} {'Wins':>6} {'Losses':>6} {'WinRate':>8}")
+    print("-" * 70)
+    for name in sorted(model_names, key=lambda n: stats[n]["wins"], reverse=True):
+        s = stats[name]
+        win_rate = s["wins"] / s["games"] * 100 if s["games"] > 0 else 0
+        print(f"  {name:<25} {s['games']:>6} {s['wins']:>6} {s['losses']:>6} {win_rate:>7.1f}%")
+    print("=" * 70)
+
+    # Head-to-head matrix
+    print("\n  Head-to-Head (row wins vs column):")
+    print(f"  {'':20}", end="")
+    for name in model_names:
+        print(f"{name[:8]:>10}", end="")
+    print()
+
+    h2h = {a: {b: 0 for b in model_names} for a in model_names}
+    for r in all_results:
+        names = r.get("player_names", [])
+        winner = r.get("winner")
+        if winner is not None and len(names) == 2:
+            winner_name = names[winner]
+            loser_name = names[1 - winner]
+            if winner_name in h2h and loser_name in h2h[winner_name]:
+                h2h[winner_name][loser_name] += 1
+
+    for a in model_names:
+        print(f"  {a:20}", end="")
+        for b in model_names:
+            if a == b:
+                print(f"{'--':>10}", end="")
+            else:
+                print(f"{h2h[a][b]:>10}", end="")
+        print()
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fox in the Forest - Round-Robin LLM Tournament"
+    )
+    parser.add_argument("--games", type=int, default=GAMES_PER_PAIR,
+                        help=f"Number of games per model pair (default: {GAMES_PER_PAIR})")
+    parser.add_argument("--target-score", type=int, default=TARGET_SCORE,
+                        help=f"Target score to win a game (default: {TARGET_SCORE})")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
+                        help=f"Max parallel workers (default: {MAX_WORKERS})")
+    parser.add_argument("--results-dir", type=str, default=RESULTS_DIR,
+                        help=f"Results directory (default: {RESULTS_DIR})")
+    parser.add_argument("--logs-dir", type=str, default=LOGS_DIR,
+                        help=f"Logs directory (default: {LOGS_DIR})")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print detailed game output")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="Only print summary of existing results, don't run new games")
+
+    args = parser.parse_args()
+
+    results_dir = os.path.abspath(args.results_dir)
+    logs_dir = os.path.abspath(args.logs_dir)
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+
+    if args.summary_only:
+        print_summary(results_dir, MODELS)
+        return
+
+    # Resume: find completed matches
+    completed = get_completed_matches(results_dir)
+    if completed:
+        print(f"[RESUME] Found {len(completed)} completed match(es), skipping them.")
+
+    # Build schedule
+    tasks = build_match_schedule(MODELS, args.games, completed)
+    total_possible = len(list(combinations(MODELS, 2))) * args.games
+    print(f"[SCHEDULE] {len(tasks)} match(es) to run "
+          f"({total_possible - len(tasks)} already completed, {total_possible} total)")
+
+    if not tasks:
+        print("[DONE] All matches already completed.")
+        print_summary(results_dir, MODELS)
+        return
+
+    # Run matches
+    results = []
+    if args.workers <= 1:
+        # Sequential execution
+        for task in tqdm(tasks, desc="Matches", unit="game"):
+            result = run_single_match(task, results_dir, logs_dir,
+                                      args.target_score, args.verbose)
+            if result:
+                results.append(result)
+    else:
+        # Parallel execution
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_task = {}
+            for task in tasks:
+                future = executor.submit(
+                    run_single_match, task, results_dir, logs_dir,
+                    args.target_score, args.verbose
+                )
+                future_to_task[future] = task
+
+            with tqdm(total=len(tasks), desc="Matches", unit="game") as pbar:
+                for future in as_completed(future_to_task):
+                    task = future_to_task[future]
+                    try:
+                            result = future.result()
+                            if result:
+                                results.append(result)
+                                winner_name = result["player_names"][result["winner"]]
+                                pbar.set_postfix_str(
+                                    f"{task.match_id}: {winner_name}")
+                    except Exception as e:
+                        pbar.write(f"[ERROR] {task.match_id} raised: {e}")
+                    pbar.update(1)
+
+    print(f"\n[COMPLETE] {len(results)} match(es) finished this run.")
+    print_summary(results_dir, MODELS)
 
 
 if __name__ == "__main__":

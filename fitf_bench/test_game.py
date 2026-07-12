@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from cards import Card, Suit
-from game import GameEngine, RoundState
-from llm_player import LLMPlayer, parse_card_tool_argument
+from fitf_bench.cards import Card, Suit
+from fitf_bench.game import GameEngine, RoundState
+from fitf_bench.llm_player import LLMPlayer, parse_card_tool_argument
 
 
 def make_round(hands, leader=0, trump=Suit.MOONS):
@@ -98,6 +98,7 @@ class ToolProtocolTests(unittest.TestCase):
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=message)],
             to_dict=lambda: {"choices": [{"message": {}}]},
+            usage=None,
         )
         player = object.__new__(LLMPlayer)
         player.player_id = 0
@@ -112,6 +113,8 @@ class ToolProtocolTests(unittest.TestCase):
         )
         player.log_path = None
         player._request_number = 0
+        player.total_output_tokens = 0
+        player._extra_api_params = {}
         return player
 
     def test_card_argument_parser_rejects_wrong_json_types(self):
@@ -174,6 +177,7 @@ class ToolProtocolTests(unittest.TestCase):
             )
             response = SimpleNamespace(
                 choices=[SimpleNamespace(message=message)],
+                usage=None,
                 to_dict=lambda: {
                     "id": "response-id",
                     "choices": [{"message": {"content": "ok", "tool_calls": None}}],
@@ -190,6 +194,8 @@ class ToolProtocolTests(unittest.TestCase):
             )
             player.log_path = log_path
             player._request_number = 0
+            player.total_output_tokens = 0
+            player._extra_api_params = {}
 
             result = player._call_llm([], "auto")
 
@@ -218,6 +224,8 @@ class ToolProtocolTests(unittest.TestCase):
             )
             player.log_path = log_path
             player._request_number = 0
+            player.total_output_tokens = 0
+            player._extra_api_params = {}
 
             with self.assertRaises(RuntimeError):
                 player._call_llm([], "auto")

@@ -6,7 +6,7 @@ from typing import List, Dict, Optional, Any, Tuple
 
 from openai import OpenAI
 
-from cards import Card, card_from_str
+from fitf_bench.cards import Card, card_from_str
 
 
 PLAY_CARD_TOOL = {
@@ -64,10 +64,10 @@ WOODCUTTER_DISCARD_TOOL = {
 }
 
 
-SYSTEM_PROMPT = """You are an excellent player playing "The Fox in the Forest", a two-player trick-taking card game. You will be asked to play cards using tool calls. Always use the appropriate tool."""
+SYSTEM_PROMPT = """You are an excellent player for "The Fox in the Forest", a two-player trick-taking card game. You will be asked to play cards using tool calls. Always use the appropriate tool."""
 
 
-STATE_SECTION_MARKER = "=== Current State"
+STATE_SECTION_MARKER = "==Current State=="
 
 
 def parse_card_tool_argument(arguments: Any) -> Tuple[Optional[str], str]:
@@ -106,7 +106,8 @@ class LLMPlayer:
     """
 
     def __init__(self, player_id: int, api_base: str, api_key: str, model: str,
-                 player_name: str = None, log_path: Optional[str] = None):
+                 player_name: str = None, log_path: Optional[str] = None,
+                 extra_api_params: Optional[Dict[str, Any]] = None):
         self.player_id = player_id
         self.player_name = player_name or f"Player {player_id + 1}"
         self.model = model
@@ -115,11 +116,14 @@ class LLMPlayer:
         self._pending_log_lines: List[str] = []
         self.log_path = log_path
         self._request_number = 0
+        self.total_output_tokens = 0
+        self._extra_api_params = extra_api_params or {}
 
     def reset_for_new_game(self):
         """Reset conversation for a new game."""
         self.messages = []
         self._pending_log_lines = []
+        self.total_output_tokens = 0
 
     def _ensure_system_prompt(self):
         """Ensure system prompt is set."""
@@ -166,7 +170,7 @@ class LLMPlayer:
         """
         parts = []
         if self._pending_log_lines:
-            parts.append("=== Game Log ===")
+            parts.append("==Game Log==")
             parts.extend(self._pending_log_lines)
             parts.append("")
             self._pending_log_lines = []
@@ -182,6 +186,7 @@ class LLMPlayer:
             "messages": self.messages,
             "tools": tools,
             "tool_choice": tool_choice,
+            **self._extra_api_params,
         }
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -194,6 +199,10 @@ class LLMPlayer:
         try:
             response = self.client.chat.completions.create(**request)
             message = response.choices[0].message
+            # Accumulate output token usage
+            if hasattr(response, "usage") and response.usage is not None:
+                completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+                self.total_output_tokens += completion_tokens
             record["response"] = self._serialize_api_value(response)
             self._write_api_log(record)
             return message

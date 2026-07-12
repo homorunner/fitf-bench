@@ -4,12 +4,11 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 
-from cards import Card, Suit, create_deck, shuffle_deck, format_hand
+from fitf_bench.cards import Card, Suit, create_deck, format_hand
 
 
 @dataclass
 class TrickResult:
-    """Result of a single trick."""
     trick_number: int
     leader: int  # 0 or 1
     leader_card: Card
@@ -22,7 +21,6 @@ class TrickResult:
 
 @dataclass
 class RoundState:
-    """State of a single round."""
     round_number: int
     dealer: int  # 0 or 1
     hands: List[List[Card]]  # hands[0], hands[1]
@@ -46,13 +44,12 @@ class RoundState:
 
 
 class GameEngine:
-    """Core game engine managing the full game."""
-
-    def __init__(self, target_score: int = 21):
+    def __init__(self, target_score: int = 21, seed: Optional[int] = None):
         self.target_score = target_score
         self.scores: List[int] = [0, 0]
         self.round_number: int = 0
-        self.dealer: int = random.randint(0, 1)
+        self._rng = random.Random(seed)
+        self.dealer: int = self._rng.randint(0, 1)
         self.current_round: Optional[RoundState] = None
         self.game_over: bool = False
         self.winner: Optional[int] = None
@@ -60,7 +57,8 @@ class GameEngine:
     def start_new_round(self) -> RoundState:
         """Deal cards and set up a new round."""
         self.round_number += 1
-        deck = shuffle_deck(create_deck())
+        deck = create_deck()
+        self._rng.shuffle(deck)
 
         hands = [sorted(deck[:13]), sorted(deck[13:26])]
         draw_deck = deck[26:]
@@ -370,10 +368,8 @@ class GameEngine:
             else:
                 if p0_base > p1_base:
                     self.winner = 0
-                elif p1_base > p0_base:
-                    self.winner = 1
                 else:
-                    self.winner = None
+                    self.winner = 1
 
         self.dealer = 1 - self.dealer
 
