@@ -74,18 +74,18 @@ MODELS: List[Dict[str, str]] = [
         "api_key": os.environ.get("API_KEY"),
         "extra_api_params": {"extra_body": {"reasoning_effort": "high"}},
     },
-    # {
-    #     "name": "Claude-Fable-5",
-    #     "model": "anthropic/claude-fable-5",
-    #     "api_base": os.environ.get("API_BASE"),
-    #     "api_key": os.environ.get("API_KEY"),
-    # },
-    # {
-    #     "name": "Claude-Sonnet-5",
-    #     "model": "anthropic/claude-sonnet-5",
-    #     "api_base": os.environ.get("API_BASE"),
-    #     "api_key": os.environ.get("API_KEY"),
-    # },
+    {
+        "name": "Claude-Fable-5",
+        "model": "anthropic/claude-fable-5",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+    },
+    {
+        "name": "Claude-Sonnet-5",
+        "model": "anthropic/claude-sonnet-5",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY"),
+    },
 ]
 
 # ===========================================================================
