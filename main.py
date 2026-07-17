@@ -20,39 +20,24 @@ from tqdm import tqdm
 from fitf_bench import GameRunner, LLMPlayer
 
 GAMES_PER_PAIR = 5
-TARGET_SCORE = 21
 MAX_WORKERS = 8
 RESULTS_DIR = "results"
 LOGS_DIR = "logs"
 
 MODELS: List[Dict[str, str]] = [
     {
-        "name": "DS-V4-Pro-Thinking",
+        "name": "DS-V4-Pro",
         "model": "deepseek-v4-pro",
         "api_base": os.environ.get("API_BASE"),
         "api_key": os.environ.get("API_KEY"),
         "extra_api_params": {"extra_body": {"thinking": {"type": "enabled"}}},
     },
     {
-        "name": "DS-V4-Pro-NonThinking",
-        "model": "deepseek-v4-pro",
-        "api_base": os.environ.get("API_BASE"),
-        "api_key": os.environ.get("API_KEY"),
-        "extra_api_params": {"extra_body": {"thinking": {"type": "disabled"}}},
-    },
-    {
-        "name": "DS-V4-Flash-Thinking",
+        "name": "DS-V4-Flash",
         "model": "deepseek-v4-flash",
         "api_base": os.environ.get("API_BASE"),
         "api_key": os.environ.get("API_KEY"),
         "extra_api_params": {"extra_body": {"thinking": {"type": "enabled"}}},
-    },
-    {
-        "name": "DS-V4-Flash-NonThinking",
-        "model": "deepseek-v4-flash",
-        "api_base": os.environ.get("API_BASE"),
-        "api_key": os.environ.get("API_KEY"),
-        "extra_api_params": {"extra_body": {"thinking": {"type": "disabled"}}},
     },
     {
         "name": "GLM-5.2-Max",
@@ -68,23 +53,22 @@ MODELS: List[Dict[str, str]] = [
         "extra_api_params": {"extra_body": {"reasoning_effort": "high"}},
     },
     {
-        "name": "GPT-5.6-Sol",
-        "model": "openai/gpt-5.6-sol",
-        "api_base": os.environ.get("API_BASE"),
-        "api_key": os.environ.get("API_KEY"),
-        "extra_api_params": {"extra_body": {"reasoning_effort": "high"}},
-    },
-    {
         "name": "Claude-Fable-5",
         "model": "anthropic/claude-fable-5",
         "api_base": os.environ.get("API_BASE"),
         "api_key": os.environ.get("API_KEY"),
     },
     {
-        "name": "Claude-Sonnet-5",
-        "model": "anthropic/claude-sonnet-5",
+        "name": "Gemini-3.5-Flash",
+        "model": "google/gemini-3.5-flash",
         "api_base": os.environ.get("API_BASE"),
         "api_key": os.environ.get("API_KEY"),
+    },
+    {
+        "name": "GPT-5.6-Sol",
+        "model": "openai/gpt-5.6-sol",
+        "api_base": os.environ.get("API_BASE"),
+        "api_key": os.environ.get("API_KEY")
     },
 ]
 
@@ -137,7 +121,7 @@ class MatchTask:
 
 
 def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
-                     target_score: int, verbose: bool) -> Optional[Dict]:
+                     verbose: bool) -> Optional[Dict]:
     """Run a single match between two models. Returns result dict or None on error."""
     result_path = os.path.join(results_dir, f"{task.match_id}.json")
     log_path = os.path.join(logs_dir, f"{task.match_id}.jsonl")
@@ -147,7 +131,7 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         api_base=task.model_a["api_base"],
         api_key=task.model_a["api_key"],
         model=task.model_a["model"],
-        player_name=task.model_a["name"],
+        model_name=task.model_a["name"],
         log_path=log_path,
         extra_api_params=task.model_a.get("extra_api_params"),
     )
@@ -156,14 +140,13 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         api_base=task.model_b["api_base"],
         api_key=task.model_b["api_key"],
         model=task.model_b["model"],
-        player_name=task.model_b["name"],
+        model_name=task.model_b["name"],
         log_path=log_path,
         extra_api_params=task.model_b.get("extra_api_params"),
     )
 
     runner = GameRunner(
         player1, player2,
-        target_score=target_score,
         verbose=verbose,
         seed=task.seed,
     )
@@ -232,9 +215,7 @@ def build_match_schedule(models: List[Dict[str, str]], games_per_pair: int,
     return tasks
 
 
-def print_summary(results_dir: str, models: List[Dict[str, str]]):
-    """Print a summary table of all completed results."""
-    # Collect all results
+def _load_all_results(results_dir: str) -> List[Dict]:
     all_results = []
     if os.path.isdir(results_dir):
         for filename in os.listdir(results_dir):
@@ -246,7 +227,11 @@ def print_summary(results_dir: str, models: List[Dict[str, str]]):
                     all_results.append(json.load(f))
             except (json.JSONDecodeError, OSError):
                 continue
+    return all_results
 
+
+def print_summary(results_dir: str, models: List[Dict[str, str]]):
+    all_results = _load_all_results(results_dir)
     if not all_results:
         print("\nNo results found.")
         return
@@ -321,8 +306,6 @@ def main():
     )
     parser.add_argument("--games", type=int, default=GAMES_PER_PAIR,
                         help=f"Number of games per model pair (default: {GAMES_PER_PAIR})")
-    parser.add_argument("--target-score", type=int, default=TARGET_SCORE,
-                        help=f"Target score to win a game (default: {TARGET_SCORE})")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS,
                         help=f"Max parallel workers (default: {MAX_WORKERS})")
     parser.add_argument("--results-dir", type=str, default=RESULTS_DIR,
@@ -367,7 +350,7 @@ def main():
         # Sequential execution
         for task in tqdm(tasks, desc="Matches", unit="game"):
             result = run_single_match(task, results_dir, logs_dir,
-                                      args.target_score, args.verbose)
+                                      args.verbose)
             if result:
                 results.append(result)
     else:
@@ -377,7 +360,7 @@ def main():
             for task in tasks:
                 future = executor.submit(
                     run_single_match, task, results_dir, logs_dir,
-                    args.target_score, args.verbose
+                    args.verbose
                 )
                 future_to_task[future] = task
 

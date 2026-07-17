@@ -4,7 +4,7 @@ import os
 import random
 from typing import Optional, List
 
-from fitf_bench.cards import Card
+from fitf_bench.cards import Card, format_hand
 from fitf_bench.game import GameEngine
 from fitf_bench.llm_player import LLMPlayer
 
@@ -22,10 +22,9 @@ class GameRunner:
     """Orchestrates the game between two LLM players."""
 
     def __init__(self, player1: LLMPlayer, player2: LLMPlayer,
-                 target_score: int = 21, verbose: bool = True,
-                 seed: Optional[int] = None):
+                 verbose: bool = True, seed: Optional[int] = None):
         self.players = [player1, player2]
-        self.engine = GameEngine(target_score=target_score, seed=seed)
+        self.engine = GameEngine(seed=seed)
         self.verbose = verbose
         self.forfeit_winner: Optional[int] = None
 
@@ -65,7 +64,7 @@ class GameRunner:
             "reason": reason,
             "scores": self.engine.scores.copy(),
             "rounds_played": self.engine.round_number,
-            "player_names": [p.player_name for p in self.players],
+            "player_names": [p.model_name for p in self.players],
             "output_tokens": [p.total_output_tokens for p in self.players],
         }
 
@@ -79,6 +78,8 @@ class GameRunner:
         )
         self.log(round_start_msg)
         self.broadcast_log(round_start_msg)
+        for p in [0, 1]:
+            self.players[p].add_log(f"Your hand: {format_hand(rs.hands[p])}")
 
         while not self.engine.is_round_over():
             if self.forfeit_winner is not None:
@@ -178,9 +179,6 @@ class GameRunner:
             card = legal_cards[0]
             auto_msg = f"  (Auto-play: {self.players[player].player_name} plays {card})"
             self.log(auto_msg)
-            self.players[player].notify_forced_play(
-                f"[Auto-play] You have only one legal play: {card}. It is played automatically."
-            )
             return card
 
         state_info = self.engine.format_game_state(player)
@@ -242,10 +240,9 @@ class GameRunner:
             card = legal_cards[0]
             events = self.engine.resolve_woodcutter_discard(player, card)
             self.log(f"  (Auto-discard: {self.players[player].player_name} discards {card})")
-            self.players[player].notify_forced_play(
-                f"[Auto-discard] You have only one card. {card} is discarded automatically."
-            )
             self._emit_events(events, broadcast=True)
+            hand_after = format_hand(self.engine.current_round.hands[player])
+            self.players[player].add_log(f"Your hand after Woodcutter: {hand_after}")
             return
 
         state_info = self.engine.format_game_state(player)
@@ -260,6 +257,8 @@ class GameRunner:
             if card is not None:
                 events = self.engine.resolve_woodcutter_discard(player, card)
                 self._emit_events(events, broadcast=True)
+                hand_after = format_hand(self.engine.current_round.hands[player])
+                self.players[player].add_log(f"Your hand after Woodcutter: {hand_after}")
                 return
 
             self.log(f"  [ERROR] {self.players[player].player_name} woodcutter attempt {attempt+1}/{MAX_RETRIES}: {error}")

@@ -44,8 +44,7 @@ class RoundState:
 
 
 class GameEngine:
-    def __init__(self, target_score: int = 21, seed: Optional[int] = None):
-        self.target_score = target_score
+    def __init__(self, seed: Optional[int] = None):
         self.scores: List[int] = [0, 0]
         self.round_number: int = 0
         self._rng = random.Random(seed)
@@ -134,7 +133,7 @@ class GameEngine:
         events = []
         if card.rank == 11:
             rs.monarch_constraint = True
-            events.append(f"Player {player+1} leads with Monarch (11 of {card.suit.value}). "
+            events.append(f"Player {player+1} leads with Monarch (11). "
                          f"Opponent must play the 1 or highest card of {card.suit.value} if they have any.")
 
         events.extend(self._activate_card_ability(player, card))
@@ -146,7 +145,7 @@ class GameEngine:
         if card.rank == 3:
             rs.pending_fox_swap = True
             rs.fox_player = player
-            events.append(f"Player {player+1} plays Fox (3 of {card.suit.value}). "
+            events.append(f"Player {player+1} plays Fox (3). "
                          f"They may exchange the decree card with a card from their hand.")
 
         if card.rank == 5:
@@ -157,10 +156,10 @@ class GameEngine:
                 rs.pending_woodcutter = True
                 rs.woodcutter_player = player
                 rs.woodcutter_drawn_card = drawn
-                events.append(f"Player {player+1} plays Woodcutter (5 of {card.suit.value}). "
+                events.append(f"Player {player+1} plays Woodcutter (5). "
                              f"They draw 1 card and must discard 1 card.")
             else:
-                events.append(f"Player {player+1} plays Woodcutter (5 of {card.suit.value}), "
+                events.append(f"Player {player+1} plays Woodcutter (5), "
                              f"but the draw deck is empty.")
 
         return events
@@ -359,7 +358,7 @@ class GameEngine:
             "total_scores": [self.scores[0], self.scores[1]],
         }
 
-        if self.scores[0] >= self.target_score or self.scores[1] >= self.target_score:
+        if self.scores[0] >= 35 or self.scores[1] >= 35:
             self.game_over = True
             if self.scores[0] > self.scores[1]:
                 self.winner = 0

@@ -100,21 +100,32 @@ class ToolProtocolTests(unittest.TestCase):
             to_dict=lambda: {"choices": [{"message": {}}]},
             usage=None,
         )
+        captured = {}
+
+        def create(**kwargs):
+            captured["request"] = kwargs
+            return response
+
         player = object.__new__(LLMPlayer)
         player.player_id = 0
         player.player_name = "Test Player"
         player.model = "test-model"
         player.messages = []
-        player._pending_log_lines = []
+        player._cumulative_log = []
+        player._rules_text = "RULES TEXT"
+        player._retry_lines = []
+        player._state_info = ""
+        player._action_description = ""
         player.client = SimpleNamespace(
             chat=SimpleNamespace(
-                completions=SimpleNamespace(create=lambda **kwargs: response)
+                completions=SimpleNamespace(create=create)
             )
         )
         player.log_path = None
         player._request_number = 0
         player.total_output_tokens = 0
         player._extra_api_params = {}
+        player._captured = captured
         return player
 
     def test_card_argument_parser_rejects_wrong_json_types(self):
@@ -125,47 +136,55 @@ class ToolProtocolTests(unittest.TestCase):
 
         self.assertEqual(parse_card_tool_argument('{"card": "B3"}'), ("B3", ""))
 
-    def test_retry_without_tool_call_uses_user_message(self):
-        player = object.__new__(LLMPlayer)
-        player.messages = [{"role": "assistant", "content": "no tool call"}]
-
-        player.inject_retry_error("missing call")
-
-        self.assertEqual(player.messages[-1]["role"], "user")
-        self.assertNotIn("tool_call_id", player.messages[-1])
-
-    def test_retry_completes_every_tool_call(self):
-        player = object.__new__(LLMPlayer)
-        player.messages = [{
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "one"}, {"id": "two"}],
-        }]
-
-        player.inject_retry_error("too many calls")
-
-        self.assertEqual(
-            [message["tool_call_id"] for message in player.messages[1:]],
-            ["one", "two"],
-        )
-
-    def test_retry_reuses_request_method_without_adding_action_prompt(self):
+    def test_sends_exactly_three_messages_with_cumulative_log(self):
         tool_call = SimpleNamespace(
             id="call-id",
             function=SimpleNamespace(name="play_card", arguments='{"card":"B3"}'),
         )
         message = SimpleNamespace(content="", tool_calls=[tool_call])
         player = self.make_player(message)
-        player.messages = [{"role": "user", "content": "existing action"}]
+        player._cumulative_log = ["event one", "event two"]
+
+        card, error = player.request_play_card(
+            "==Current State==\nYour hand: B3", [Card(Suit.BELLS, 3)]
+        )
+
+        self.assertEqual(card, Card(Suit.BELLS, 3))
+        self.assertEqual(error, "")
+        req_messages = player._captured["request"]["messages"]
+        self.assertEqual([m["role"] for m in req_messages],
+                         ["system", "system", "user"])
+        self.assertIn("RULES TEXT", req_messages[1]["content"])
+        user_content = req_messages[2]["content"]
+        self.assertIn("event one", user_content)
+        self.assertIn("event two", user_content)
+        self.assertIn("==Current State==", user_content)
+        self.assertEqual([m["role"] for m in player.messages],
+                         ["system", "system", "user"])
+
+    def test_retry_appends_error_and_keeps_three_messages(self):
+        tool_call = SimpleNamespace(
+            id="call-id",
+            function=SimpleNamespace(name="play_card", arguments='{"card":"B3"}'),
+        )
+        message = SimpleNamespace(content="", tool_calls=[tool_call])
+        player = self.make_player(message)
+        player._state_info = "==Current State==\nYour hand: B3"
+        player._action_description = "Play a card."
+        player.inject_retry_error("Illegal play")
 
         card, error = player.request_play_card(None, [Card(Suit.BELLS, 3)])
 
         self.assertEqual(card, Card(Suit.BELLS, 3))
-        self.assertEqual(error, "")
-        self.assertEqual(
-            [entry["role"] for entry in player.messages],
-            ["user", "assistant", "tool"],
-        )
+        req_messages = player._captured["request"]["messages"]
+        self.assertEqual(len(req_messages), 3)
+        self.assertIn("Illegal play", req_messages[2]["content"])
+
+        player.request_play_card("==Current State==\nYour hand: B3",
+                                 [Card(Suit.BELLS, 3)])
+        self.assertEqual(player._retry_lines, [])
+        self.assertNotIn("Illegal play",
+                         player._captured["request"]["messages"][2]["content"])
 
     def test_api_call_logs_request_and_response(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -234,6 +253,56 @@ class ToolProtocolTests(unittest.TestCase):
                 record = json.loads(log_file.read())
             self.assertEqual(record["error"]["type"], "RuntimeError")
             self.assertEqual(record["error"]["message"], "service unavailable")
+
+    def test_api_call_empty_choices_raises_and_logs_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = os.path.join(directory, "game.jsonl")
+            response = SimpleNamespace(
+                choices=[],
+                usage=None,
+                to_dict=lambda: {"id": "response-id", "choices": []},
+            )
+
+            def create(**kwargs):
+                return response
+
+            player = object.__new__(LLMPlayer)
+            player.player_id = 0
+            player.player_name = "Test Player"
+            player.model = "test-model"
+            player.messages = []
+            player.client = SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+            )
+            player.log_path = log_path
+            player._request_number = 0
+            player.total_output_tokens = 0
+            player._extra_api_params = {}
+
+            with self.assertRaises(ValueError):
+                player._call_llm([], "auto")
+
+            with open(log_path, "r", encoding="utf-8") as log_file:
+                lines = [l for l in log_file.read().splitlines() if l.strip()]
+            self.assertEqual(len(lines), 1)
+            record = json.loads(lines[0])
+            self.assertEqual(record["response"]["id"], "response-id")
+            self.assertEqual(record["error"]["type"], "ValueError")
+
+    def test_empty_choices_is_retryable_api_error(self):
+        response = SimpleNamespace(choices=[], usage=None,
+                                   to_dict=lambda: {"choices": []})
+        player = self.make_player(SimpleNamespace(content="", tool_calls=[]))
+        player.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kw: response)
+            )
+        )
+        card, error = player.request_play_card(
+            "==Current State==\nYour hand: B3", [Card(Suit.BELLS, 3)]
+        )
+        self.assertIsNone(card)
+        self.assertIn("API error", error)
 
 
 if __name__ == "__main__":
