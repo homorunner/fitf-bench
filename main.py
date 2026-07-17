@@ -285,32 +285,7 @@ def print_summary(results_dir: str, models: List[Dict[str, str]],
         print(f"  {name:<25} {s['games']:>6} {s['wins']:>6} {s['losses']:>6} {win_rate:>7.1f}%")
     print("=" * 70)
 
-    # Head-to-head matrix
-    print("\n  Head-to-Head (row wins vs column):")
-    print(f"  {'':20}", end="")
-    for name in model_names:
-        print(f"{name[:8]:>10}", end="")
-    print()
 
-    h2h = {a: {b: 0 for b in model_names} for a in model_names}
-    for r in all_results:
-        names = r.get("player_names", [])
-        winner = r.get("winner")
-        if winner is not None and len(names) == 2:
-            winner_name = names[winner]
-            loser_name = names[1 - winner]
-            if winner_name in h2h and loser_name in h2h[winner_name]:
-                h2h[winner_name][loser_name] += 1
-
-    for a in model_names:
-        print(f"  {a:20}", end="")
-        for b in model_names:
-            if a == b:
-                print(f"{'--':>10}", end="")
-            else:
-                print(f"{h2h[a][b]:>10}", end="")
-        print()
-    print()
 
 
 def main():

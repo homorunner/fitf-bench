@@ -138,27 +138,30 @@ def compute_confidence_intervals(results: List[Dict], k: float = 32.0,
 
 def print_elo_table(ratings: Dict[str, float],
                     ci: Dict[str, Tuple[float, float, float]] = None,
-                    game_counts: Dict[str, int] = None):
+                    game_counts: Dict[str, int] = None,
+                    win_rates: Dict[str, float] = None):
     print("\n  ELO RATINGS:")
 
     if ci:
-        print(f"  {'#':<4} {'Model':<25} {'Elo':>7} {'95% CI':>16} {'Games':>7}")
+        print(f"  {'#':<4} {'Model':<25} {'Elo':>7} {'95% CI':>16} {'Games':>7} {'WinRate':>8}")
         print("-" * 72)
         for rank, (name, rating) in enumerate(
             sorted(ratings.items(), key=lambda x: x[1], reverse=True), 1
         ):
             lower, _, upper = ci.get(name, (0, 0, 0))
             games = game_counts.get(name, 0) if game_counts else 0
+            wr = win_rates.get(name, 0) if win_rates else 0
             print(f"  {rank:<4} {name:<25} {rating:>7.1f} "
-                  f"[{lower:>6.1f}, {upper:>6.1f}] {games:>7}")
+                  f"[{lower:>6.1f}, {upper:>6.1f}] {games:>7} {wr:>7.1f}%")
     else:
-        print(f"  {'#':<4} {'Model':<25} {'Elo':>7} {'Games':>7}")
+        print(f"  {'#':<4} {'Model':<25} {'Elo':>7} {'Games':>7} {'WinRate':>8}")
         print("-" * 72)
         for rank, (name, rating) in enumerate(
             sorted(ratings.items(), key=lambda x: x[1], reverse=True), 1
         ):
             games = game_counts.get(name, 0) if game_counts else 0
-            print(f"  {rank:<4} {name:<25} {rating:>7.1f} {games:>7}")
+            wr = win_rates.get(name, 0) if win_rates else 0
+            print(f"  {rank:<4} {name:<25} {rating:>7.1f} {games:>7} {wr:>7.1f}%")
 
 
 def print_head_to_head(results: List[Dict], model_names: List[str]):
@@ -251,8 +254,18 @@ def main():
         ci = compute_confidence_intervals(results, k=args.k, initial=args.initial,
                                            bootstrap_rounds=args.bootstrap, seed=args.seed)
 
+    # Compute win rates per model
+    model_wins: Dict[str, int] = defaultdict(int)
+    for r in results:
+        winner = r.get("winner")
+        names = r.get("player_names", [])
+        if winner is not None and winner < len(names):
+            model_wins[names[winner]] += 1
+    win_rates = {name: (model_wins[name] / game_counts[name] * 100) if game_counts[name] else 0
+                 for name in game_counts}
+
     # Print results
-    print_elo_table(ratings, ci=ci, game_counts=game_counts)
+    print_elo_table(ratings, ci=ci, game_counts=game_counts, win_rates=win_rates)
     model_names = sorted(ratings.keys(), key=lambda n: ratings[n], reverse=True)
     print_head_to_head(results, model_names)
 
