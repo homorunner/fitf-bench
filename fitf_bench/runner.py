@@ -1,9 +1,9 @@
-"""Game runner for Fox in the Forest - orchestrates a single match between two LLM players."""
+"""Fox in the Forest runner for a single match between two LLM players."""
 
 import os
-import random
-from typing import Optional, List
+from typing import Optional
 
+from fitf_bench.base import TwoPlayerGameRunner
 from fitf_bench.cards import Card, format_hand
 from fitf_bench.game import GameEngine
 from fitf_bench.llm_player import LLMPlayer
@@ -18,23 +18,16 @@ def load_rules() -> str:
         return f.read()
 
 
-class GameRunner:
+class GameRunner(TwoPlayerGameRunner):
     """Orchestrates the game between two LLM players."""
+
+    game_id = "fox-in-the-forest"
 
     def __init__(self, player1: LLMPlayer, player2: LLMPlayer,
                  verbose: bool = True, seed: Optional[int] = None):
-        self.players = [player1, player2]
+        super().__init__(player1, player2, verbose=verbose, seed=seed)
         self.engine = GameEngine(seed=seed)
-        self.verbose = verbose
         self.forfeit_winner: Optional[int] = None
-
-    def log(self, msg: str):
-        if self.verbose:
-            print(msg)
-
-    def broadcast_log(self, msg: str):
-        for p in self.players:
-            p.add_log(msg)
 
     def run_game(self) -> dict:
         rules = load_rules()
@@ -59,14 +52,12 @@ class GameRunner:
                  f"{self.players[1].player_name}: {self.engine.scores[1]}")
         self.log(f"  Winner: {self.players[winner].player_name} ({reason})")
 
-        return {
-            "winner": winner,
-            "reason": reason,
-            "scores": self.engine.scores.copy(),
-            "rounds_played": self.engine.round_number,
-            "player_names": [p.model_name for p in self.players],
-            "output_tokens": [p.total_output_tokens for p in self.players],
-        }
+        return self.build_result(
+            winner,
+            reason,
+            scores=self.engine.scores.copy(),
+            rounds_played=self.engine.round_number,
+        )
 
     def run_round(self):
         rs = self.engine.start_new_round()

@@ -16,7 +16,8 @@ from collections import defaultdict
 from typing import List, Dict, Tuple
 
 
-def load_results(results_dir: str) -> List[Dict]:
+def load_results(results_dir: str,
+                 game_id: str = "fox-in-the-forest") -> List[Dict]:
     results = []
     if not os.path.isdir(results_dir):
         return results
@@ -28,7 +29,9 @@ def load_results(results_dir: str) -> List[Dict]:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
             # Validate required fields
-            if "player_names" in data and "winner" in data:
+            result_game = data.get("game", "fox-in-the-forest")
+            if (result_game == game_id and "player_names" in data
+                    and "winner" in data):
                 results.append(data)
         except (json.JSONDecodeError, OSError):
             continue
@@ -203,6 +206,8 @@ def print_head_to_head(results: List[Dict], model_names: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Compute Elo ratings from tournament results")
+    parser.add_argument("--game", default="fox-in-the-forest",
+                        help="Game results to include (default: fox-in-the-forest)")
     parser.add_argument("--results-dir", type=str, default="results",
                         help="Results directory (default: results)")
     parser.add_argument("--k", type=float, default=32.0,
@@ -221,7 +226,7 @@ def main():
     args = parser.parse_args()
 
     results_dir = os.path.abspath(args.results_dir)
-    results = load_results(results_dir)
+    results = load_results(results_dir, args.game)
 
     if not results:
         print(f"No results found in {results_dir}")

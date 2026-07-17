@@ -1,4 +1,4 @@
-"""Round-robin tournament for Fox in the Forest LLM benchmark.
+"""Round-robin tournament for two-player LLM game benchmarks.
 
 Defines a set of LLM models and runs a full round-robin tournament where each
 pair of models plays k games. Supports:
@@ -17,7 +17,7 @@ from typing import List, Dict, Optional
 
 from tqdm import tqdm
 
-from fitf_bench import GameRunner, LLMPlayer
+from fitf_bench import GAMES, LLMPlayer, get_game
 
 GAMES_PER_PAIR = 5
 MAX_WORKERS = 8
@@ -76,14 +76,16 @@ MODELS: List[Dict[str, str]] = [
 # MATCH ID AND RESUME LOGIC
 # ===========================================================================
 
-def make_match_id(model_a_name: str, model_b_name: str, game_index: int) -> str:
+def make_match_id(model_a_name: str, model_b_name: str, game_index: int,
+                  game_id: str = "fox-in-the-forest") -> str:
     """Create a deterministic match ID from the two model names and game index.
     
     The match ID is independent of player order (alphabetically sorted names),
     so A-vs-B game 1 and B-vs-A game 1 produce the same ID.
     """
     names = sorted([model_a_name, model_b_name])
-    return f"{names[0]}_vs_{names[1]}_game{game_index}"
+    prefix = "" if game_id == "fox-in-the-forest" else f"{game_id}_"
+    return f"{prefix}{names[0]}_vs_{names[1]}_game{game_index}"
 
 
 def get_completed_matches(results_dir: str) -> set:
@@ -117,11 +119,11 @@ class MatchTask:
     model_b: Dict[str, str]
     game_index: int
     match_id: str
-    seed: int
+    seed: str
 
 
 def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
-                     verbose: bool) -> Optional[Dict]:
+                     verbose: bool, game_id: str = "fox-in-the-forest") -> Optional[Dict]:
     """Run a single match between two models. Returns result dict or None on error."""
     result_path = os.path.join(results_dir, f"{task.match_id}.json")
     log_path = os.path.join(logs_dir, f"{task.match_id}.jsonl")
@@ -145,10 +147,9 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         extra_api_params=task.model_b.get("extra_api_params"),
     )
 
-    runner = GameRunner(
-        player1, player2,
-        verbose=verbose,
-        seed=task.seed,
+    game = get_game(game_id)
+    runner = game.create_runner(
+        player1, player2, verbose=verbose, seed=task.seed
     )
 
     try:
@@ -168,14 +169,18 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
     result["game_index"] = task.game_index
     result["model_a"] = task.model_a["name"]
     result["model_b"] = task.model_b["name"]
+    result["game"] = game_id
 
     # Write result
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     winner_name = result["player_names"][result["winner"]]
-    print(f"[DONE] {task.match_id}: {winner_name} wins "
-          f"({result['scores'][0]}-{result['scores'][1]}, {result['reason']})")
+    score_text = ""
+    if len(result.get("scores", [])) == 2:
+        score_text = f" ({result['scores'][0]}-{result['scores'][1]})"
+    print(f"[DONE] {task.match_id}: {winner_name} wins{score_text} "
+          f"({result['reason']})")
 
     return result
 
@@ -185,7 +190,8 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
 # ===========================================================================
 
 def build_match_schedule(models: List[Dict[str, str]], games_per_pair: int,
-                         completed: set) -> List[MatchTask]:
+                         completed: set,
+                         game_id: str = "fox-in-the-forest") -> List[MatchTask]:
     """Build list of matches to run, skipping already-completed ones.
     
     For each pair (A, B), we play `games_per_pair` games. In even-indexed games
@@ -196,7 +202,9 @@ def build_match_schedule(models: List[Dict[str, str]], games_per_pair: int,
     tasks = []
     for model_a, model_b in combinations(models, 2):
         for game_idx in range(games_per_pair):
-            match_id = make_match_id(model_a["name"], model_b["name"], game_idx)
+            match_id = make_match_id(
+                model_a["name"], model_b["name"], game_idx, game_id
+            )
             if match_id in completed:
                 continue
             seed = str(game_idx)
@@ -215,7 +223,8 @@ def build_match_schedule(models: List[Dict[str, str]], games_per_pair: int,
     return tasks
 
 
-def _load_all_results(results_dir: str) -> List[Dict]:
+def _load_all_results(results_dir: str,
+                      game_id: str = "fox-in-the-forest") -> List[Dict]:
     all_results = []
     if os.path.isdir(results_dir):
         for filename in os.listdir(results_dir):
@@ -224,14 +233,17 @@ def _load_all_results(results_dir: str) -> List[Dict]:
             filepath = os.path.join(results_dir, filename)
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
-                    all_results.append(json.load(f))
+                    result = json.load(f)
+                if result.get("game", "fox-in-the-forest") == game_id:
+                    all_results.append(result)
             except (json.JSONDecodeError, OSError):
                 continue
     return all_results
 
 
-def print_summary(results_dir: str, models: List[Dict[str, str]]):
-    all_results = _load_all_results(results_dir)
+def print_summary(results_dir: str, models: List[Dict[str, str]],
+                  game_id: str = "fox-in-the-forest"):
+    all_results = _load_all_results(results_dir, game_id)
     if not all_results:
         print("\nNo results found.")
         return
@@ -246,13 +258,14 @@ def print_summary(results_dir: str, models: List[Dict[str, str]]):
         names = r.get("player_names", [])
         winner = r.get("winner")
         reason = r.get("reason", "")
-        scores = r.get("scores", [0, 0])
+        scores = r.get("scores")
 
         for i, name in enumerate(names):
             if name not in stats:
                 continue
             stats[name]["games"] += 1
-            stats[name]["total_score"] += scores[i]
+            if scores and len(scores) == 2:
+                stats[name]["total_score"] += scores[i]
             if winner == i:
                 stats[name]["wins"] += 1
                 if reason == "forfeit":
@@ -302,8 +315,10 @@ def print_summary(results_dir: str, models: List[Dict[str, str]]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fox in the Forest - Round-Robin LLM Tournament"
+        description="Two-Player LLM Game Tournament"
     )
+    parser.add_argument("--game", choices=GAMES, default="fox-in-the-forest",
+                        help="Game to run (default: fox-in-the-forest)")
     parser.add_argument("--games", type=int, default=GAMES_PER_PAIR,
                         help=f"Number of games per model pair (default: {GAMES_PER_PAIR})")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS,
@@ -325,7 +340,7 @@ def main():
     os.makedirs(logs_dir, exist_ok=True)
 
     if args.summary_only:
-        print_summary(results_dir, MODELS)
+        print_summary(results_dir, MODELS, args.game)
         return
 
     # Resume: find completed matches
@@ -334,14 +349,14 @@ def main():
         print(f"[RESUME] Found {len(completed)} completed match(es), skipping them.")
 
     # Build schedule
-    tasks = build_match_schedule(MODELS, args.games, completed)
+    tasks = build_match_schedule(MODELS, args.games, completed, args.game)
     total_possible = len(list(combinations(MODELS, 2))) * args.games
     print(f"[SCHEDULE] {len(tasks)} match(es) to run "
           f"({total_possible - len(tasks)} already completed, {total_possible} total)")
 
     if not tasks:
         print("[DONE] All matches already completed.")
-        print_summary(results_dir, MODELS)
+        print_summary(results_dir, MODELS, args.game)
         return
 
     # Run matches
@@ -350,7 +365,7 @@ def main():
         # Sequential execution
         for task in tqdm(tasks, desc="Matches", unit="game"):
             result = run_single_match(task, results_dir, logs_dir,
-                                      args.verbose)
+                                      args.verbose, args.game)
             if result:
                 results.append(result)
     else:
@@ -360,7 +375,7 @@ def main():
             for task in tasks:
                 future = executor.submit(
                     run_single_match, task, results_dir, logs_dir,
-                    args.verbose
+                    args.verbose, args.game
                 )
                 future_to_task[future] = task
 
@@ -379,7 +394,7 @@ def main():
                     pbar.update(1)
 
     print(f"\n[COMPLETE] {len(results)} match(es) finished this run.")
-    print_summary(results_dir, MODELS)
+    print_summary(results_dir, MODELS, args.game)
 
 
 if __name__ == "__main__":

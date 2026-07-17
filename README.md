@@ -11,6 +11,17 @@ python elo.py               # Compute Elo ratings
 
 Configure models in `main.py` `MODELS` list. Supports parallel execution, deterministic seeds, and auto-resume.
 
+## Adding a Game
+
+New games use the shared `TwoPlayerGameRunner` and `LLMPlayer.request_action()` interfaces:
+
+1. Implement a runner subclass that loads its rules, maintains the game log and current state, and validates tool-call actions.
+2. Return results with `build_result(winner, reason, **game_data)`.
+3. Register a `GameDefinition` in `fitf_bench/game_registry.py`.
+
+The tournament runner, model setup, API logging, retries, and result metadata are shared across games.
+Use `python main.py --game <game-id>` and `python elo.py --game <game-id>` to run and analyze a registered game.
+
 ## Results
 
 ### Elo Ratings

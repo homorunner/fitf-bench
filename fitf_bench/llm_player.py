@@ -1,4 +1,4 @@
-"""LLM Player interface for Fox in the Forest via OpenAI-compatible API with tool calls."""
+"""LLM player interface for text games using OpenAI-compatible tool calls."""
 
 import json
 import re
@@ -65,15 +65,18 @@ WOODCUTTER_DISCARD_TOOL = {
 }
 
 
-SYSTEM_PROMPT = """You are an excellent player for "The Fox in the Forest", a two-player trick-taking card game. You will be asked to play cards using tool calls. Always use the appropriate tool."""
+SYSTEM_PROMPT = """You are playing a two-player game. Use the provided rules, game log, and current state to choose the best action. Always respond with exactly one call to the provided tool."""
 
 
 def parse_card_tool_argument(arguments: Any) -> Tuple[Optional[str], str]:
     """Parse and type-check a card tool's JSON arguments."""
-    try:
-        args = json.loads(arguments)
-    except (json.JSONDecodeError, TypeError):
-        return None, "Invalid JSON in tool arguments."
+    if isinstance(arguments, dict):
+        args = arguments
+    else:
+        try:
+            args = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            return None, "Invalid JSON in tool arguments."
 
     if not isinstance(args, dict):
         return None, "Tool arguments must be a JSON object."
@@ -237,9 +240,10 @@ class LLMPlayer:
             {"role": "user", "content": user_content},
         ]
 
-    def _request_tool(self, tool: dict, tool_name: str,
-                      state_info: Optional[str] = None,
-                      action_description: Optional[str] = None):
+    def request_action(self, tool: dict, state_info: Optional[str] = None,
+                       action_description: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Request one tool call and return its decoded argument object."""
+        tool_name = tool["function"]["name"]
         # For the first attempt of an action, remember the state/action so that
         # retries (which pass state_info=None) can rebuild the same 3 messages.
         if state_info is not None:
@@ -265,10 +269,13 @@ class LLMPlayer:
         if tc.function.name != tool_name:
             return None, f"Wrong tool called: {tc.function.name}. Use {tool_name}."
 
-        card_str, error = parse_card_tool_argument(tc.function.arguments)
-        if error:
-            return None, error
-        return card_str, ""
+        try:
+            arguments = json.loads(tc.function.arguments)
+        except (json.JSONDecodeError, TypeError):
+            return None, "Invalid JSON in tool arguments."
+        if not isinstance(arguments, dict):
+            return None, "Tool arguments must be a JSON object."
+        return arguments, ""
 
     def request_play_card(self, state_info: Optional[str],
                           legal_cards: List[Card]) -> Tuple[Optional[Card], str]:
@@ -279,9 +286,10 @@ class LLMPlayer:
                       f"Legal plays: {', '.join(legal_strs)}\n"
                       "Please use the play_card tool to choose your card.")
 
-        card_str, error = self._request_tool(
-            PLAY_CARD_TOOL, "play_card", state_info, action
-        )
+        arguments, error = self.request_action(PLAY_CARD_TOOL, state_info, action)
+        if error:
+            return None, error
+        card_str, error = parse_card_tool_argument(arguments)
         if error:
             return None, error
         card = card_from_str(card_str)
@@ -304,9 +312,10 @@ class LLMPlayer:
                       "You may swap the decree card with any card from your hand, or choose 'none' to skip.\n"
                       "Please use the fox_swap tool.")
 
-        card_str, error = self._request_tool(
-            FOX_SWAP_TOOL, "fox_swap", state_info, action
-        )
+        arguments, error = self.request_action(FOX_SWAP_TOOL, state_info, action)
+        if error:
+            return None, False, error
+        card_str, error = parse_card_tool_argument(arguments)
         if error:
             return None, False, error
 
@@ -334,9 +343,12 @@ class LLMPlayer:
                       "You must discard 1 card to the bottom of the draw deck.\n"
                       "Please use the woodcutter_discard tool.")
 
-        card_str, error = self._request_tool(
-            WOODCUTTER_DISCARD_TOOL, "woodcutter_discard", state_info, action
+        arguments, error = self.request_action(
+            WOODCUTTER_DISCARD_TOOL, state_info, action
         )
+        if error:
+            return None, error
+        card_str, error = parse_card_tool_argument(arguments)
         if error:
             return None, error
         card = card_from_str(card_str)

@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+from elo import load_results
 from fitf_bench.cards import Card, Suit
+from fitf_bench.game_registry import get_game
 from fitf_bench.game import GameEngine, RoundState
 from fitf_bench.llm_player import LLMPlayer, parse_card_tool_argument
 
@@ -135,6 +137,54 @@ class ToolProtocolTests(unittest.TestCase):
             self.assertTrue(error)
 
         self.assertEqual(parse_card_tool_argument('{"card": "B3"}'), ("B3", ""))
+        self.assertEqual(parse_card_tool_argument({"card": "B3"}), ("B3", ""))
+
+    def test_generic_action_returns_decoded_arguments(self):
+        tool_call = SimpleNamespace(
+            id="call-id",
+            function=SimpleNamespace(
+                name="choose_move", arguments='{"row":2,"column":3}'
+            ),
+        )
+        player = self.make_player(
+            SimpleNamespace(content="", tool_calls=[tool_call])
+        )
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "choose_move",
+                "description": "Choose a move",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        arguments, error = player.request_action(tool, "state", "choose")
+
+        self.assertEqual(arguments, {"row": 2, "column": 3})
+        self.assertEqual(error, "")
+
+    def test_default_game_is_registered(self):
+        game = get_game("fox-in-the-forest")
+
+        self.assertEqual(game.name, "The Fox in the Forest")
+        self.assertEqual(game.runner_class.game_id, game.game_id)
+
+    def test_elo_results_are_filtered_by_game(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = [
+                {"game": "fox-in-the-forest", "player_names": ["a", "b"],
+                 "winner": 0},
+                {"game": "other-game", "player_names": ["a", "b"],
+                 "winner": 1},
+            ]
+            for index, result in enumerate(results):
+                with open(os.path.join(directory, f"{index}.json"), "w",
+                          encoding="utf-8") as result_file:
+                    json.dump(result, result_file)
+
+            loaded = load_results(directory, "other-game")
+
+        self.assertEqual(loaded, [results[1]])
 
     def test_sends_exactly_three_messages_with_cumulative_log(self):
         tool_call = SimpleNamespace(
