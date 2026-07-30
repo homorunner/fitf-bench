@@ -2,12 +2,13 @@
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any, Tuple
 
 from openai import OpenAI
 
-from fitf_bench.cards import Card, card_from_str
+from fitf_bench.games.fitf.cards import Card, card_from_str
 
 
 PLAY_CARD_TOOL = {
@@ -103,12 +104,14 @@ class LLMPlayer:
 
     def __init__(self, player_id: int, api_base: str, api_key: str, model: str,
                  model_name: Optional[str] = None,
-                 log_path: Optional[str] = None, extra_api_params: Optional[Dict[str, Any]] = None):
+                 game_id: Optional[str] = None, log_path: Optional[str] = None,
+                 extra_api_params: Optional[Dict[str, Any]] = None):
         self.player_id = player_id
         # Keep model identities out of prompts and game logs.
         self.player_name = f"Player {player_id + 1}"
         self.model_name = model_name or self.player_name
         self.model = model
+        self.game_id = game_id
         self.client = OpenAI(base_url=api_base, api_key=api_key)
         self.messages: List[Dict[str, Any]] = []
         self._cumulative_log: List[str] = []
@@ -138,43 +141,48 @@ class LLMPlayer:
         self._cumulative_log.append(text)
 
     def _call_llm(self, tools: List[dict], tool_choice: Any = "auto") -> Any:
-        """Make LLM API call and return the response message."""
-        self._request_number += 1
-        request = {
-            "model": self.model,
-            "messages": self.messages,
-            "tools": tools,
-            "tool_choice": tool_choice,
-            **self._extra_api_params,
-        }
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "player_id": self.player_id,
-            "player_name": self.player_name,
-            "request_number": self._request_number,
-            "request": request,
-        }
-
-        try:
-            response = self.client.chat.completions.create(**request)
-            record["response"] = self._serialize_api_value(response)
-            # Accumulate output token usage
-            if hasattr(response, "usage") and response.usage is not None:
-                completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-                self.total_output_tokens += completion_tokens
-            choices = getattr(response, "choices", None)
-            if not choices:
-                raise ValueError("API returned no choices in response.")
-            message = choices[0].message
-            self._write_api_log(record)
-            return message
-        except Exception as exc:
-            record["error"] = {
-                "type": type(exc).__name__,
-                "message": str(exc),
+        """Make LLM API call with retry on failure. Retries up to 3 times with delays of 1s, 3s, 10s."""
+        delays = [1, 3, 10]
+        for attempt in range(len(delays) + 1):
+            self._request_number += 1
+            request = {
+                "model": self.model,
+                "messages": self.messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
+                **self._extra_api_params,
             }
-            self._write_api_log(record)
-            raise
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "game_id": self.game_id,
+                "player_id": self.player_id,
+                "player_name": self.player_name,
+                "request_number": self._request_number,
+                "request": request,
+            }
+
+            try:
+                response = self.client.chat.completions.create(**request)
+                record["response"] = self._serialize_api_value(response)
+                if hasattr(response, "usage") and response.usage is not None:
+                    completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+                    self.total_output_tokens += completion_tokens
+                choices = getattr(response, "choices", None)
+                if not choices:
+                    raise ValueError("API returned no choices in response.")
+                message = choices[0].message
+                self._write_api_log(record)
+                return message
+            except Exception as exc:
+                record["error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                self._write_api_log(record)
+                if attempt < len(delays):
+                    time.sleep(delays[attempt])
+                    continue
+                raise
 
     @staticmethod
     def _serialize_api_value(value: Any) -> Any:

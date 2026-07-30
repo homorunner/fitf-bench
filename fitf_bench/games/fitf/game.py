@@ -4,7 +4,7 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 
-from fitf_bench.cards import Card, Suit, create_deck, format_hand
+from fitf_bench.games.fitf.cards import Card, Suit, create_deck, format_hand
 
 
 @dataclass

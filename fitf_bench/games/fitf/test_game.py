@@ -3,11 +3,12 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from elo import load_results
-from fitf_bench.cards import Card, Suit
+from fitf_bench.games.fitf.cards import Card, Suit
 from fitf_bench.game_registry import get_game
-from fitf_bench.game import GameEngine, RoundState
+from fitf_bench.games.fitf.game import GameEngine, RoundState
 from fitf_bench.llm_player import LLMPlayer, parse_card_tool_argument
 
 
@@ -111,6 +112,7 @@ class ToolProtocolTests(unittest.TestCase):
         player = object.__new__(LLMPlayer)
         player.player_id = 0
         player.player_name = "Test Player"
+        player.game_id = "test-game"
         player.model = "test-model"
         player.messages = []
         player._cumulative_log = []
@@ -172,10 +174,11 @@ class ToolProtocolTests(unittest.TestCase):
     def test_elo_results_are_filtered_by_game(self):
         with tempfile.TemporaryDirectory() as directory:
             results = [
-                {"game": "fox-in-the-forest", "player_names": ["a", "b"],
+                {"game_id": "fox-in-the-forest", "player_names": ["a", "b"],
                  "winner": 0},
-                {"game": "other-game", "player_names": ["a", "b"],
+                {"game_id": "other-game", "player_names": ["a", "b"],
                  "winner": 1},
+                {"player_names": ["a", "b"], "winner": 0},
             ]
             for index, result in enumerate(results):
                 with open(os.path.join(directory, f"{index}.json"), "w",
@@ -195,9 +198,10 @@ class ToolProtocolTests(unittest.TestCase):
         player = self.make_player(message)
         player._cumulative_log = ["event one", "event two"]
 
-        card, error = player.request_play_card(
-            "==Current State==\nYour hand: B3", [Card(Suit.BELLS, 3)]
-        )
+        with patch("fitf_bench.llm_player.time.sleep"):
+            card, error = player.request_play_card(
+                "==Current State==\nYour hand: B3", [Card(Suit.BELLS, 3)]
+            )
 
         self.assertEqual(card, Card(Suit.BELLS, 3))
         self.assertEqual(error, "")
@@ -256,6 +260,7 @@ class ToolProtocolTests(unittest.TestCase):
             player = object.__new__(LLMPlayer)
             player.player_id = 0
             player.player_name = "Test Player"
+            player.game_id = "test-game"
             player.model = "test-model"
             player.messages = [{"role": "user", "content": "test"}]
             player.client = SimpleNamespace(
@@ -272,6 +277,7 @@ class ToolProtocolTests(unittest.TestCase):
             with open(log_path, "r", encoding="utf-8") as log_file:
                 record = json.loads(log_file.read())
             self.assertEqual(record["player_name"], "Test Player")
+            self.assertEqual(record["game_id"], "test-game")
             self.assertEqual(record["request"]["tool_choice"], "auto")
             self.assertEqual(record["response"]["id"], "response-id")
             self.assertEqual(record["response"]["choices"][0]["message"]["content"], "ok")
@@ -286,6 +292,7 @@ class ToolProtocolTests(unittest.TestCase):
             player = object.__new__(LLMPlayer)
             player.player_id = 1
             player.player_name = "Test Player"
+            player.game_id = "test-game"
             player.model = "test-model"
             player.messages = []
             player.client = SimpleNamespace(
@@ -296,13 +303,21 @@ class ToolProtocolTests(unittest.TestCase):
             player.total_output_tokens = 0
             player._extra_api_params = {}
 
-            with self.assertRaises(RuntimeError):
-                player._call_llm([], "auto")
+            with patch("fitf_bench.llm_player.time.sleep") as sleep:
+                with self.assertRaises(RuntimeError):
+                    player._call_llm([], "auto")
 
             with open(log_path, "r", encoding="utf-8") as log_file:
-                record = json.loads(log_file.read())
-            self.assertEqual(record["error"]["type"], "RuntimeError")
-            self.assertEqual(record["error"]["message"], "service unavailable")
+                records = [json.loads(line) for line in log_file if line.strip()]
+            self.assertEqual(len(records), 4)
+            self.assertEqual([record["request_number"] for record in records],
+                             [1, 2, 3, 4])
+            self.assertTrue(all(record["error"]["type"] == "RuntimeError"
+                                for record in records))
+            self.assertTrue(all(record["error"]["message"] == "service unavailable"
+                                for record in records))
+            self.assertEqual([call.args[0] for call in sleep.call_args_list],
+                             [1, 3, 10])
 
     def test_api_call_empty_choices_raises_and_logs_response(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -319,6 +334,7 @@ class ToolProtocolTests(unittest.TestCase):
             player = object.__new__(LLMPlayer)
             player.player_id = 0
             player.player_name = "Test Player"
+            player.game_id = "test-game"
             player.model = "test-model"
             player.messages = []
             player.client = SimpleNamespace(
@@ -329,15 +345,18 @@ class ToolProtocolTests(unittest.TestCase):
             player.total_output_tokens = 0
             player._extra_api_params = {}
 
-            with self.assertRaises(ValueError):
-                player._call_llm([], "auto")
+            with patch("fitf_bench.llm_player.time.sleep"):
+                with self.assertRaises(ValueError):
+                    player._call_llm([], "auto")
 
             with open(log_path, "r", encoding="utf-8") as log_file:
                 lines = [l for l in log_file.read().splitlines() if l.strip()]
-            self.assertEqual(len(lines), 1)
-            record = json.loads(lines[0])
-            self.assertEqual(record["response"]["id"], "response-id")
-            self.assertEqual(record["error"]["type"], "ValueError")
+            self.assertEqual(len(lines), 4)
+            records = [json.loads(line) for line in lines]
+            self.assertTrue(all(record["response"]["id"] == "response-id"
+                                for record in records))
+            self.assertTrue(all(record["error"]["type"] == "ValueError"
+                                for record in records))
 
     def test_empty_choices_is_retryable_api_error(self):
         response = SimpleNamespace(choices=[], usage=None,
@@ -348,9 +367,10 @@ class ToolProtocolTests(unittest.TestCase):
                 completions=SimpleNamespace(create=lambda **kw: response)
             )
         )
-        card, error = player.request_play_card(
-            "==Current State==\nYour hand: B3", [Card(Suit.BELLS, 3)]
-        )
+        with patch("fitf_bench.llm_player.time.sleep"):
+            card, error = player.request_play_card(
+                "==Current State==\nYour hand: B3", [Card(Suit.BELLS, 3)]
+            )
         self.assertIsNone(card)
         self.assertIn("API error", error)
 

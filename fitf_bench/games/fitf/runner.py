@@ -4,8 +4,8 @@ import os
 from typing import Optional
 
 from fitf_bench.base import TwoPlayerGameRunner
-from fitf_bench.cards import Card, format_hand
-from fitf_bench.game import GameEngine
+from fitf_bench.games.fitf.cards import Card, format_hand
+from fitf_bench.games.fitf.game import GameEngine
 from fitf_bench.llm_player import LLMPlayer
 
 

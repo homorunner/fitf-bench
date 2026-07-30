@@ -29,8 +29,7 @@ def load_results(results_dir: str,
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
             # Validate required fields
-            result_game = data.get("game", "fox-in-the-forest")
-            if (result_game == game_id and "player_names" in data
+            if (data.get("game_id") == game_id and "player_names" in data
                     and "winner" in data):
                 results.append(data)
         except (json.JSONDecodeError, OSError):

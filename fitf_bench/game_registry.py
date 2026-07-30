@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Dict, Type
 
 from fitf_bench.base import TwoPlayerGameRunner
-from fitf_bench.runner import GameRunner
+from fitf_bench.games.fitf.runner import GameRunner
+from fitf_bench.games.numdec.game import NumberDecompositionRunner
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,11 @@ GAMES: Dict[str, GameDefinition] = {
         game_id="fox-in-the-forest",
         name="The Fox in the Forest",
         runner_class=GameRunner,
+    ),
+    "number-decomposition": GameDefinition(
+        game_id="number-decomposition",
+        name="Number Decomposition",
+        runner_class=NumberDecompositionRunner,
     ),
 }
 
