@@ -33,11 +33,11 @@ MODELS: List[Dict[str, str]] = [
         "extra_api_params": {"extra_body": {"thinking": {"type": "enabled"}}},
     },
     {
-        "name": "DS-V4-Flash",
+        "name": "DS-V4-Flash-GA",
         "model": "deepseek-v4-flash",
         "api_base": os.environ.get("API_BASE"),
         "api_key": os.environ.get("API_KEY"),
-        "extra_api_params": {"extra_body": {"thinking": {"type": "enabled"}}},
+        "extra_api_params": {"extra_body": {"thinking": {"type": "enabled"}}, "max_tokens": 65536},
     },
     {
         "name": "GLM-5.2-Max",
