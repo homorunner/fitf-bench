@@ -17,7 +17,7 @@ from typing import List, Dict, Tuple
 
 
 def load_results(results_dir: str,
-                 game_id: str = "fox-in-the-forest") -> List[Dict]:
+                 game_id: str = "all") -> List[Dict]:
     results = []
     if not os.path.isdir(results_dir):
         return results
@@ -29,8 +29,8 @@ def load_results(results_dir: str,
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
             # Validate required fields
-            if (data.get("game_id") == game_id and "player_names" in data
-                    and "winner" in data):
+            if (("player_names" in data) and ("winner" in data)
+                    and (game_id == "all" or data.get("game_id") == game_id)):
                 results.append(data)
         except (json.JSONDecodeError, OSError):
             continue
@@ -208,8 +208,8 @@ def print_head_to_head(results: List[Dict], model_names: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Compute Elo ratings from tournament results")
-    parser.add_argument("--game", default="fox-in-the-forest",
-                        help="Game results to include (default: fox-in-the-forest)")
+    parser.add_argument("--game", default="all",
+                        help="Game results to include, 'all' for all games (default: all)")
     parser.add_argument("--results-dir", type=str, default="results",
                         help="Results directory (default: results)")
     parser.add_argument("--k", type=float, default=32.0,
