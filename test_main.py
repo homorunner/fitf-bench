@@ -5,7 +5,40 @@ import unittest
 from unittest.mock import patch
 
 import main
-from main import build_match_schedule, get_completed_matches, make_match_id
+from main import (
+    MatchTask,
+    build_match_schedule,
+    get_completed_matches,
+    make_match_id,
+    run_single_match,
+)
+
+
+def _make_task():
+    return MatchTask(
+        model_a={"name": "model-a", "api_base": "x", "api_key": "x",
+                 "model": "a"},
+        model_b={"name": "model-b", "api_base": "x", "api_key": "x",
+                 "model": "b"},
+        game_id="fox-in-the-forest",
+        game_index=0,
+        match_id="fox-in-the-forest_model-a_vs_model-b_game0",
+        seed="0",
+    )
+
+
+class FakeGame:
+    def __init__(self, result):
+        self._result = result
+
+    def create_runner(self, player1, player2, verbose, seed):
+        result = self._result
+
+        class Runner:
+            def run_game(self):
+                return dict(result)
+
+        return Runner()
 
 
 class MatchIdTests(unittest.TestCase):
@@ -73,6 +106,48 @@ class MatchIdTests(unittest.TestCase):
                 main.main()
 
         self.assertEqual(captured_games, list(main.GAMES))
+
+
+class RunSingleMatchTests(unittest.TestCase):
+    def test_api_error_result_is_not_recorded(self):
+        game = FakeGame({
+            "winner": None,
+            "reason": "api_error",
+            "api_error_player": 1,
+            "player_names": ["model-a", "model-b"],
+            "output_tokens": [0, 0],
+        })
+        task = _make_task()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("main.get_game", return_value=game), \
+                    patch("main.LLMPlayer"):
+                result = run_single_match(task, directory, directory, False)
+
+            self.assertIsNone(result)
+            result_path = os.path.join(directory, f"{task.match_id}.json")
+            self.assertFalse(os.path.exists(result_path))
+
+    def test_forfeit_result_is_recorded_as_a_win(self):
+        game = FakeGame({
+            "winner": 1,
+            "reason": "forfeit",
+            "player_names": ["model-a", "model-b"],
+            "output_tokens": [0, 0],
+        })
+        task = _make_task()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("main.get_game", return_value=game), \
+                    patch("main.LLMPlayer"):
+                result = run_single_match(task, directory, directory, False)
+
+            self.assertIsNotNone(result)
+            result_path = os.path.join(directory, f"{task.match_id}.json")
+            with open(result_path, "r", encoding="utf-8") as result_file:
+                recorded = json.load(result_file)
+
+        self.assertEqual(recorded["reason"], "forfeit")
+        self.assertEqual(recorded["winner"], 1)
+        self.assertEqual(recorded["match_id"], task.match_id)
 
 
 if __name__ == "__main__":

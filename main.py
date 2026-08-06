@@ -168,9 +168,11 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         print(f"[ERROR] Match {task.match_id} failed with exception: {e}")
         return None
 
-    if result.get("reason") == "forfeit":
-        winner_name = result["player_names"][result["winner"]]
-        print(f"[FORFEIT] {task.match_id}: {winner_name} by forfeit (not recorded)")
+    if result.get("reason") == "api_error":
+        # Infrastructure failure: nobody's fault, don't record, replay later.
+        failed = result["player_names"][result["api_error_player"]]
+        print(f"[ABORT] {task.match_id}: repeated API errors for {failed} "
+              f"(not recorded, will be replayed)")
         return None
 
     # Enrich result with tournament metadata
@@ -259,7 +261,7 @@ def print_summary(results_dir: str, models: List[Dict[str, str]], game_id: str):
     # Build stats per model
     model_names = [m["name"] for m in models]
     stats = {name: {"wins": 0, "losses": 0, "forfeits_won": 0,
-                    "total_score": 0, "games": 0}
+                    "forfeits_lost": 0, "total_score": 0, "games": 0}
              for name in model_names}
 
     for r in all_results:
@@ -280,17 +282,20 @@ def print_summary(results_dir: str, models: List[Dict[str, str]], game_id: str):
                     stats[name]["forfeits_won"] += 1
             else:
                 stats[name]["losses"] += 1
+                if reason == "forfeit":
+                    stats[name]["forfeits_lost"] += 1
 
     # Print table
     print("\n" + "=" * 70)
     print(f"  TOURNAMENT SUMMARY: {GAMES[game_id].name}")
     print("=" * 70)
-    print(f"  {'Model':<25} {'Games':>6} {'Wins':>6} {'Losses':>6} {'WinRate':>8}")
+    print(f"  {'Model':<25} {'Games':>6} {'Wins':>6} {'Losses':>6} {'WinRate':>8} {'FfWins':>7} {'FfLosses':>9}")
     print("-" * 70)
     for name in sorted(model_names, key=lambda n: stats[n]["wins"], reverse=True):
         s = stats[name]
         win_rate = s["wins"] / s["games"] * 100 if s["games"] > 0 else 0
-        print(f"  {name:<25} {s['games']:>6} {s['wins']:>6} {s['losses']:>6} {win_rate:>7.1f}%")
+        print(f"  {name:<25} {s['games']:>6} {s['wins']:>6} {s['losses']:>6} {win_rate:>7.1f}% "
+              f"{s['forfeits_won']:>7} {s['forfeits_lost']:>9}")
     print("=" * 70)
 
 

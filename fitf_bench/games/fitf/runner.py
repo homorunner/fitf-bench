@@ -9,9 +9,6 @@ from fitf_bench.games.fitf.game import GameEngine
 from fitf_bench.llm_player import LLMPlayer
 
 
-MAX_RETRIES = 3
-
-
 def load_rules() -> str:
     rules_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RULES.md")
     with open(rules_path, "r", encoding="utf-8") as f:
@@ -27,7 +24,6 @@ class GameRunner(TwoPlayerGameRunner):
                  verbose: bool = True, seed: Optional[int] = None):
         super().__init__(player1, player2, verbose=verbose, seed=seed)
         self.engine = GameEngine(seed=seed)
-        self.forfeit_winner: Optional[int] = None
 
     def run_game(self) -> dict:
         rules = load_rules()
@@ -37,15 +33,17 @@ class GameRunner(TwoPlayerGameRunner):
 
         while not self.engine.game_over:
             self.run_round()
-            if self.forfeit_winner is not None:
+            if self.stopped:
                 break
 
-        if self.forfeit_winner is not None:
-            winner = self.forfeit_winner
-            reason = "forfeit"
-        else:
-            winner = self.engine.winner
-            reason = "score"
+        if self.stopped:
+            return self.build_stopped_result(
+                scores=self.engine.scores.copy(),
+                rounds_played=self.engine.round_number,
+            )
+
+        winner = self.engine.winner
+        reason = "score"
 
         self.log("\n  GAME OVER")
         self.log(f"  Final scores: {self.players[0].player_name}: {self.engine.scores[0]}, "
@@ -73,7 +71,7 @@ class GameRunner(TwoPlayerGameRunner):
             self.players[p].add_log(f"Your hand: {format_hand(rs.hands[p])}")
 
         while not self.engine.is_round_over():
-            if self.forfeit_winner is not None:
+            if self.stopped:
                 return
             self.run_trick()
 
@@ -157,11 +155,11 @@ class GameRunner(TwoPlayerGameRunner):
         rs = self.engine.current_round
         if rs.pending_fox_swap and rs.fox_player == player:
             self._handle_fox_swap(player)
-            if self.forfeit_winner is not None:
+            if self.stopped:
                 return False
         if rs.pending_woodcutter and rs.woodcutter_player == player:
             self._handle_woodcutter_discard(player)
-        return self.forfeit_winner is None
+        return not self.stopped
 
     def _get_play(self, player: int, is_lead: bool, lead_card: Optional[Card] = None) -> Optional[Card]:
         legal_cards = self.engine.get_legal_plays(player, lead_card if not is_lead else None)
@@ -174,21 +172,13 @@ class GameRunner(TwoPlayerGameRunner):
 
         state_info = self.engine.format_game_state(player)
 
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player].inject_retry_error(error)
-            card, error = self.players[player].request_play_card(
-                state_info if attempt == 0 else None, legal_cards
-            )
-
-            if card is not None:
-                return card
-
-            self.log(f"  [ERROR] {self.players[player].player_name} attempt {attempt+1}/{MAX_RETRIES}: {error}")
-
-        self.log(f"  [FORFEIT] {self.players[player].player_name} failed to make a legal play after {MAX_RETRIES} attempts.")
-        self.forfeit_winner = 1 - player
-        return None
+        card, ok = self.request_with_retries(
+            player, "play_card",
+            lambda first: self.players[player].request_play_card(
+                state_info if first else None, legal_cards
+            ),
+        )
+        return card if ok else None
 
     def _handle_fox_swap(self, player: int):
         rs = self.engine.current_round
@@ -201,26 +191,18 @@ class GameRunner(TwoPlayerGameRunner):
 
         state_info = self.engine.format_game_state(player)
 
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player].inject_retry_error(error)
+        def attempt(first: bool):
             card, skipped, error = self.players[player].request_fox_swap(
-                state_info if attempt == 0 else None, legal_cards, rs.decree_card
+                state_info if first else None, legal_cards, rs.decree_card
             )
+            return (card, skipped), error
 
-            if skipped:
-                events = self.engine.resolve_fox_swap(player, None)
-                self._emit_events(events, broadcast=True)
-                return
-            if card is not None:
-                events = self.engine.resolve_fox_swap(player, card)
-                self._emit_events(events, broadcast=True)
-                return
-
-            self.log(f"  [ERROR] {self.players[player].player_name} fox_swap attempt {attempt+1}/{MAX_RETRIES}: {error}")
-
-        self.log(f"  [FORFEIT] {self.players[player].player_name} failed fox_swap after {MAX_RETRIES} attempts.")
-        self.forfeit_winner = 1 - player
+        choice, ok = self.request_with_retries(player, "fox_swap", attempt)
+        if not ok:
+            return
+        card, skipped = choice
+        events = self.engine.resolve_fox_swap(player, None if skipped else card)
+        self._emit_events(events, broadcast=True)
 
     def _handle_woodcutter_discard(self, player: int):
         rs = self.engine.current_round
@@ -238,21 +220,15 @@ class GameRunner(TwoPlayerGameRunner):
 
         state_info = self.engine.format_game_state(player)
 
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player].inject_retry_error(error)
-            card, error = self.players[player].request_woodcutter_discard(
-                state_info if attempt == 0 else None, legal_cards, drawn_card
-            )
-
-            if card is not None:
-                events = self.engine.resolve_woodcutter_discard(player, card)
-                self._emit_events(events, broadcast=True)
-                hand_after = format_hand(self.engine.current_round.hands[player])
-                self.players[player].add_log(f"Your hand after Woodcutter: {hand_after}")
-                return
-
-            self.log(f"  [ERROR] {self.players[player].player_name} woodcutter attempt {attempt+1}/{MAX_RETRIES}: {error}")
-
-        self.log(f"  [FORFEIT] {self.players[player].player_name} failed woodcutter_discard after {MAX_RETRIES} attempts.")
-        self.forfeit_winner = 1 - player
+        card, ok = self.request_with_retries(
+            player, "woodcutter_discard",
+            lambda first: self.players[player].request_woodcutter_discard(
+                state_info if first else None, legal_cards, drawn_card
+            ),
+        )
+        if not ok:
+            return
+        events = self.engine.resolve_woodcutter_discard(player, card)
+        self._emit_events(events, broadcast=True)
+        hand_after = format_hand(self.engine.current_round.hands[player])
+        self.players[player].add_log(f"Your hand after Woodcutter: {hand_after}")

@@ -8,7 +8,6 @@ from fitf_bench.base import TwoPlayerGameRunner
 from fitf_bench.llm_player import LLMPlayer
 
 
-MAX_RETRIES = 3
 FIRST_PLAYER_TURN_LIMIT = 16
 
 CHOOSE_NUMBER_TOOL = {
@@ -99,7 +98,6 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
         self.round_wins = [0, 0]
         self.round_number = 0
         self.state: Optional[RoundState] = None
-        self.forfeit_winner: Optional[int] = None
 
     def run_game(self) -> Dict[str, Any]:
         rules = load_rules()
@@ -108,7 +106,7 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
             player.send_rules(rules)
 
         round_winners = []
-        while max(self.round_wins) < 2 and self.forfeit_winner is None:
+        while max(self.round_wins) < 2 and not self.stopped:
             winner = self._run_round()
             if winner is not None:
                 self.round_wins[winner] += 1
@@ -118,12 +116,15 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
                 self.log(message)
                 self.broadcast_log(message)
 
-        if self.forfeit_winner is not None:
-            winner = self.forfeit_winner
-            reason = "forfeit"
-        else:
-            winner = 0 if self.round_wins[0] == 2 else 1
-            reason = "rounds"
+        if self.stopped:
+            return self.build_stopped_result(
+                scores=self.round_wins.copy(),
+                rounds_played=self.round_number,
+                round_winners=round_winners,
+            )
+
+        winner = 0 if self.round_wins[0] == 2 else 1
+        reason = "rounds"
 
         return self.build_result(
             winner,
@@ -150,7 +151,7 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
                 f"Your secret starting number for round {self.round_number}: {number}."
             )
 
-        while self.forfeit_winner is None:
+        while not self.stopped:
             winner = self._run_turn()
             if winner is not None:
                 return winner
@@ -162,20 +163,19 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
                  f"Opponent {self.round_wins[1 - player_id]}")
         action = "Choose your secret starting integer from 2 to 100."
 
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player_id].inject_retry_error(error)
+        def attempt(first: bool):
             arguments, error = self.players[player_id].request_action(
-                CHOOSE_NUMBER_TOOL, state if attempt == 0 else None, action
+                CHOOSE_NUMBER_TOOL, state if first else None, action
             )
-            if not error:
-                number = arguments.get("number")
-                if isinstance(number, int) and not isinstance(number, bool) and 2 <= number <= 100:
-                    return number
-                error = "The starting number must be an integer from 2 to 100."
+            if error:
+                return None, error
+            number = arguments.get("number")
+            if isinstance(number, int) and not isinstance(number, bool) and 2 <= number <= 100:
+                return number, ""
+            return None, "The starting number must be an integer from 2 to 100."
 
-        self._forfeit(player_id, "failed to choose a valid starting number")
-        return None
+        number, ok = self.request_with_retries(player_id, "choose_number", attempt)
+        return number if ok else None
 
     def _run_turn(self) -> Optional[int]:
         state = self.state
@@ -227,26 +227,24 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
         action = ("Choose one attack. Subtraction requires an integer from 1 to 5; "
                   "division requires any positive integer.")
 
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player_id].inject_retry_error(error)
+        def attempt(first: bool):
             arguments, error = self.players[player_id].request_action(
-                ATTACK_TOOL, state if attempt == 0 else None, action
+                ATTACK_TOOL, state if first else None, action
             )
-            if not error:
-                operation = arguments.get("operation")
-                number = arguments.get("number")
-                if not isinstance(number, int) or isinstance(number, bool):
-                    error = "The attack number must be an integer."
-                else:
-                    try:
-                        evaluate_attack(2, operation, number)
-                        return operation, number
-                    except ValueError as exc:
-                        error = str(exc)
+            if error:
+                return None, error
+            operation = arguments.get("operation")
+            number = arguments.get("number")
+            if not isinstance(number, int) or isinstance(number, bool):
+                return None, "The attack number must be an integer."
+            try:
+                evaluate_attack(2, operation, number)
+            except ValueError as exc:
+                return None, str(exc)
+            return (operation, number), ""
 
-        self._forfeit(player_id, "failed to choose a valid attack")
-        return None
+        attack, ok = self.request_with_retries(player_id, "attack", attempt)
+        return attack if ok else None
 
     def _request_response(self, player_id: int, operation: str, number: int,
                           truthful_success: bool) -> Optional[bool]:
@@ -261,21 +259,19 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
         action = ("Secretly decide whether to spend your lie. If you lie, the opposite "
                   "result is announced and your number does not change.")
 
-        for attempt in range(MAX_RETRIES):
-            if attempt:
-                self.players[player_id].inject_retry_error(error)
+        def attempt(first: bool):
             arguments, error = self.players[player_id].request_action(
-                RESPOND_TOOL, state if attempt == 0 else None, action
+                RESPOND_TOOL, state if first else None, action
             )
-            if not error:
-                lie = arguments.get("lie")
-                if not isinstance(lie, bool):
-                    error = "The lie field must be true or false."
-                else:
-                    return lie
+            if error:
+                return None, error
+            lie = arguments.get("lie")
+            if not isinstance(lie, bool):
+                return None, "The lie field must be true or false."
+            return lie, ""
 
-        self._forfeit(player_id, "failed to give a valid response")
-        return None
+        lie, ok = self.request_with_retries(player_id, "respond_to_attack", attempt)
+        return lie if ok else None
 
     def _format_state(self, player_id: int, situation: str) -> str:
         state = self.state
@@ -287,7 +283,3 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
                 f"Opponent {state.turns_taken[1 - player_id]}\n"
                 f"Your current number: {state.numbers[player_id]}\n"
                 f"Your lie: {lie_status}\n{situation}")
-
-    def _forfeit(self, player_id: int, reason: str):
-        self.log(f"Player {player_id + 1} forfeits: {reason}.")
-        self.forfeit_winner = 1 - player_id

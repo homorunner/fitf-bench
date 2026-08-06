@@ -5,6 +5,7 @@ from fitf_bench.games.numdec.game import (
     RoundState,
     evaluate_attack,
 )
+from fitf_bench.llm_player import API_ERROR, ActionError
 
 
 class FakePlayer:
@@ -35,6 +36,24 @@ class FakePlayer:
         if actual_tool != expected_tool:
             raise AssertionError(f"Expected {expected_tool}, got {actual_tool}")
         return arguments, ""
+
+
+class ScriptedPlayer(FakePlayer):
+    """FakePlayer whose actions may be (tool, arguments, error) tuples."""
+
+    def __init__(self, player_id, actions):
+        super().__init__(player_id, actions)
+        self.retry_errors = []
+
+    def inject_retry_error(self, error):
+        self.retry_errors.append(error)
+
+    def request_action(self, tool, state_info=None, action_description=None):
+        expected_tool, arguments, error = self.actions.pop(0)
+        actual_tool = tool["function"]["name"]
+        if actual_tool != expected_tool:
+            raise AssertionError(f"Expected {expected_tool}, got {actual_tool}")
+        return arguments, error
 
 
 class AttackTests(unittest.TestCase):
@@ -191,6 +210,69 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Player 1 acts first", player0.logs[0])
         self.assertEqual(player0.actions, [])
         self.assertEqual(player1.actions, [])
+
+
+class ErrorClassificationTests(unittest.TestCase):
+    def test_repeated_model_errors_forfeit_the_match(self):
+        player0 = ScriptedPlayer(0, [
+            ("choose_number", {"number": 1}, ""),
+            ("choose_number", {"number": "ten"}, ""),
+            ("choose_number", None, ActionError("No tool call made.")),
+        ])
+        player1 = ScriptedPlayer(1, [])
+        runner = NumberDecompositionRunner(player0, player1, verbose=False)
+
+        result = runner.run_game()
+
+        self.assertEqual(result["reason"], "forfeit")
+        self.assertEqual(result["winner"], 1)
+        self.assertEqual(runner.forfeit_winner, 1)
+        self.assertIsNone(runner.abort_player)
+        # Model errors are fed back for retries (2 retries after 2 failures).
+        self.assertEqual(len(player0.retry_errors), 2)
+
+    def test_repeated_api_errors_abort_without_winner(self):
+        api_error = ActionError("API error: boom", API_ERROR)
+        player0 = ScriptedPlayer(0, [
+            ("choose_number", None, api_error),
+            ("choose_number", None, api_error),
+            ("choose_number", None, api_error),
+        ])
+        player1 = ScriptedPlayer(1, [])
+        runner = NumberDecompositionRunner(player0, player1, verbose=False)
+
+        result = runner.run_game()
+
+        self.assertEqual(result["reason"], "api_error")
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["api_error_player"], 0)
+        self.assertIsNone(runner.forfeit_winner)
+        # API errors are not the model's fault: no retry feedback injected.
+        self.assertEqual(player0.retry_errors, [])
+
+    def test_api_and_model_errors_are_budgeted_separately(self):
+        api_error = ActionError("API error: boom", API_ERROR)
+        player0 = ScriptedPlayer(0, [
+            # 2 API errors + 2 model errors: neither budget (3) is exhausted.
+            ("choose_number", None, api_error),
+            ("choose_number", {"number": 1}, ""),
+            ("choose_number", None, api_error),
+            ("choose_number", {"number": 0}, ""),
+            ("choose_number", {"number": 10}, ""),
+            ("attack", {"operation": "divide", "number": 10}, ""),
+        ])
+        player1 = ScriptedPlayer(1, [
+            ("choose_number", {"number": 10}, ""),
+            ("respond_to_attack", {"lie": False}, ""),
+        ])
+        runner = NumberDecompositionRunner(player0, player1, verbose=False)
+
+        winner = runner._run_round()
+
+        self.assertEqual(winner, 0)
+        self.assertFalse(runner.stopped)
+        self.assertEqual(player0.actions, [])
+        self.assertEqual(len(player0.retry_errors), 2)
 
 
 if __name__ == "__main__":

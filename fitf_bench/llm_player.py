@@ -69,6 +69,31 @@ WOODCUTTER_DISCARD_TOOL = {
 SYSTEM_PROMPT = """You are playing a two-player game. Use the provided rules, game log, and current state to choose the best action. Always respond with exactly one call to the provided tool."""
 
 
+API_ERROR = "api"
+MODEL_ERROR = "model"
+
+
+class ActionError(str):
+    """An error message tagged with its origin kind.
+
+    Behaves exactly like a plain string (logging, retry feedback), but
+    carries a `kind` attribute so retry loops can budget API errors and
+    model errors separately.
+    """
+
+    kind: str = MODEL_ERROR
+
+    def __new__(cls, message: str, kind: str = MODEL_ERROR) -> "ActionError":
+        error = super().__new__(cls, message)
+        error.kind = kind
+        return error
+
+
+def error_kind(error: Any) -> str:
+    """Classify an error message; untagged plain strings are model errors."""
+    return getattr(error, "kind", MODEL_ERROR)
+
+
 def parse_card_tool_argument(arguments: Any) -> Tuple[Optional[str], str]:
     """Parse and type-check a card tool's JSON arguments."""
     if isinstance(arguments, dict):
@@ -266,23 +291,25 @@ class LLMPlayer:
         try:
             msg = self._call_llm([tool], "auto")
         except Exception as e:
-            return None, f"API error: {e}"
+            return None, ActionError(f"API error: {e}", API_ERROR)
 
         if not msg.tool_calls:
-            return None, f"No tool call made. You must use the {tool_name} tool."
+            return None, ActionError(
+                f"No tool call made. You must use the {tool_name} tool.")
         if len(msg.tool_calls) != 1:
-            return None, f"Make exactly one {tool_name} tool call."
+            return None, ActionError(f"Make exactly one {tool_name} tool call.")
 
         tc = msg.tool_calls[0]
         if tc.function.name != tool_name:
-            return None, f"Wrong tool called: {tc.function.name}. Use {tool_name}."
+            return None, ActionError(
+                f"Wrong tool called: {tc.function.name}. Use {tool_name}.")
 
         try:
             arguments = json.loads(tc.function.arguments)
         except (json.JSONDecodeError, TypeError):
-            return None, "Invalid JSON in tool arguments."
+            return None, ActionError("Invalid JSON in tool arguments.")
         if not isinstance(arguments, dict):
-            return None, "Tool arguments must be a JSON object."
+            return None, ActionError("Tool arguments must be a JSON object.")
         return arguments, ""
 
     def request_play_card(self, state_info: Optional[str],
