@@ -80,7 +80,6 @@ class RunnerTests(unittest.TestCase):
             ("respond_to_attack", {"lie": True}),
         ])
         runner = NumberDecompositionRunner(attacker, defender, verbose=False)
-        runner.round_number = 1
         runner.state = RoundState(numbers=[20, 10], lies_available=[True, True])
 
         winner = runner._run_turn()
@@ -99,7 +98,6 @@ class RunnerTests(unittest.TestCase):
             ("respond_to_attack", {"lie": True}),
         ])
         runner = NumberDecompositionRunner(attacker, defender, verbose=False)
-        runner.round_number = 1
         runner.state = RoundState(numbers=[20, 10], lies_available=[True, True])
 
         winner = runner._run_turn()
@@ -114,7 +112,6 @@ class RunnerTests(unittest.TestCase):
         ])
         defender = FakePlayer(1, [])
         runner = NumberDecompositionRunner(attacker, defender, verbose=False)
-        runner.round_number = 1
         runner.state = RoundState(numbers=[20, 10], lies_available=[True, False])
 
         winner = runner._run_turn()
@@ -129,7 +126,6 @@ class RunnerTests(unittest.TestCase):
         ])
         defender = FakePlayer(1, [])
         runner = NumberDecompositionRunner(attacker, defender, verbose=False)
-        runner.round_number = 1
         runner.state = RoundState(
             numbers=[20, 10],
             lies_available=[False, False],
@@ -150,7 +146,6 @@ class RunnerTests(unittest.TestCase):
         ])
         defender = FakePlayer(1, [])
         runner = NumberDecompositionRunner(attacker, defender, verbose=False)
-        runner.round_number = 1
         runner.state = RoundState(
             numbers=[20, 10],
             lies_available=[False, False],
@@ -172,7 +167,6 @@ class RunnerTests(unittest.TestCase):
             ("respond_to_attack", {"lie": True}),
         ])
         runner = NumberDecompositionRunner(attacker, defender, verbose=False)
-        runner.round_number = 1
         runner.state = RoundState(
             numbers=[20, 10],
             lies_available=[False, True],
@@ -186,17 +180,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(winner, 1)
         self.assertEqual(runner.state.numbers[1], 10)
 
-    def test_best_of_three_resets_numbers_and_lies_each_round(self):
+    def test_single_win_decides_the_game(self):
         player0 = FakePlayer(0, [
             ("choose_number", {"number": 10}),
             ("attack", {"operation": "divide", "number": 10}),
-            ("choose_number", {"number": 12}),
-            ("attack", {"operation": "divide", "number": 12}),
         ])
         player1 = FakePlayer(1, [
             ("choose_number", {"number": 10}),
-            ("respond_to_attack", {"lie": False}),
-            ("choose_number", {"number": 12}),
             ("respond_to_attack", {"lie": False}),
         ])
         runner = NumberDecompositionRunner(player0, player1, verbose=False)
@@ -204,9 +194,8 @@ class RunnerTests(unittest.TestCase):
         result = runner.run_game()
 
         self.assertEqual(result["winner"], 0)
-        self.assertEqual(result["scores"], [2, 0])
-        self.assertEqual(result["rounds_played"], 2)
-        self.assertEqual(result["round_winners"], [0, 0])
+        self.assertEqual(result["reason"], "win")
+        self.assertEqual(result["turns_taken"], [1, 0])
         self.assertIn("Player 1 acts first", player0.logs[0])
         self.assertEqual(player0.actions, [])
         self.assertEqual(player1.actions, [])

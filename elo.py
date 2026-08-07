@@ -13,7 +13,9 @@ import math
 import os
 import random
 from collections import defaultdict
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
+
+from initial_elo import V1_ELO
 
 
 def load_results(results_dir: str,
@@ -38,7 +40,8 @@ def load_results(results_dir: str,
 
 
 def compute_elo(results: List[Dict], k: float = 32.0, initial: float = 1500.0,
-                iterations: int = 100, seed: int = 42) -> Dict[str, float]:
+                iterations: int = 100, seed: int = 42,
+                baseline: Optional[Dict[str, float]] = None) -> Dict[str, float]:
     """Compute Elo ratings by replaying all games multiple times in shuffled order.
 
     To reduce sensitivity to game ordering, we shuffle and replay the full set of
@@ -47,9 +50,10 @@ def compute_elo(results: List[Dict], k: float = 32.0, initial: float = 1500.0,
     Args:
         results: List of game result dicts with 'player_names' and 'winner'.
         k: K-factor (controls rating sensitivity per game).
-        initial: Initial Elo rating for all models.
+        initial: Initial Elo rating for models without a baseline entry.
         iterations: Number of shuffle-and-replay passes for stability.
         seed: Random seed for reproducibility.
+        baseline: Optional per-model starting ratings.
 
     Returns:
         Dict mapping model name to Elo rating.
@@ -63,13 +67,16 @@ def compute_elo(results: List[Dict], k: float = 32.0, initial: float = 1500.0,
     if not all_models:
         return {}
 
+    baseline = baseline or {}
     rng = random.Random(seed)
 
     # Accumulate ratings across iterations
     rating_sums: Dict[str, float] = defaultdict(float)
 
     for _ in range(iterations):
-        ratings: Dict[str, float] = {name: initial for name in all_models}
+        ratings: Dict[str, float] = {
+            name: baseline.get(name, initial) for name in all_models
+        }
         shuffled = results.copy()
         rng.shuffle(shuffled)
 
@@ -107,7 +114,9 @@ def compute_elo(results: List[Dict], k: float = 32.0, initial: float = 1500.0,
 def compute_confidence_intervals(results: List[Dict], k: float = 32.0,
                                   initial: float = 1500.0,
                                   bootstrap_rounds: int = 1000,
-                                  seed: int = 42) -> Dict[str, Tuple[float, float, float]]:
+                                  seed: int = 42,
+                                  baseline: Optional[Dict[str, float]] = None
+                                  ) -> Dict[str, Tuple[float, float, float]]:
     """Compute Elo ratings with 95% confidence intervals via bootstrapping.
 
     Returns:
@@ -119,7 +128,7 @@ def compute_confidence_intervals(results: List[Dict], k: float = 32.0,
     for _ in range(bootstrap_rounds):
         sample = [rng.choice(results) for _ in range(len(results))]
         ratings = compute_elo(sample, k=k, initial=initial, iterations=1,
-                              seed=rng.randint(0, 2**31))
+                              seed=rng.randint(0, 2**31), baseline=baseline)
         for name, rating in ratings.items():
             all_ratings[name].append(rating)
 
@@ -234,6 +243,7 @@ def main():
         print(f"No results found in {results_dir}")
         return
 
+    baseline = V1_ELO
     print(f"Loaded {len(results)} game result(s) from {results_dir}")
 
     # Count games per model
@@ -244,14 +254,16 @@ def main():
 
     # Compute Elo ratings
     ratings = compute_elo(results, k=args.k, initial=args.initial,
-                          iterations=args.iterations, seed=args.seed)
+                          iterations=args.iterations, seed=args.seed,
+                          baseline=baseline)
 
     # Compute confidence intervals
     ci = None
     if not args.no_ci and len(results) >= 10:
         print("Computing confidence intervals (bootstrapping)...")
         ci = compute_confidence_intervals(results, k=args.k, initial=args.initial,
-                                           bootstrap_rounds=args.bootstrap, seed=args.seed)
+                                           bootstrap_rounds=args.bootstrap, seed=args.seed,
+                                           baseline=baseline)
 
     # Compute win rates per model
     model_wins: Dict[str, int] = defaultdict(int)

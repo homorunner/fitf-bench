@@ -1,17 +1,35 @@
 import json
 import os
+import random
 import tempfile
 import unittest
+from collections import Counter
 from unittest.mock import patch
 
 import main
 from main import (
+    MatchScheduler,
     MatchTask,
-    build_match_schedule,
-    get_completed_matches,
+    load_all_results,
     make_match_id,
     run_single_match,
 )
+from initial_elo import DEFAULT_ELO, V1_ELO
+
+
+def _models(*names):
+    return [{"name": name, "api_base": "x", "api_key": "x", "model": name}
+            for name in names]
+
+
+def _result(name_a, name_b, winner, game_id="fox-in-the-forest", **extra):
+    return {
+        "player_names": [name_a, name_b],
+        "winner": winner,
+        "reason": "score",
+        "game_id": game_id,
+        **extra,
+    }
 
 
 def _make_task():
@@ -21,8 +39,7 @@ def _make_task():
         model_b={"name": "model-b", "api_base": "x", "api_key": "x",
                  "model": "b"},
         game_id="fox-in-the-forest",
-        game_index=0,
-        match_id="fox-in-the-forest_model-a_vs_model-b_game0",
+        match_id="fox-in-the-forest_model-a_vs_model-b_test_0001",
         seed="0",
     )
 
@@ -42,70 +59,177 @@ class FakeGame:
 
 
 class MatchIdTests(unittest.TestCase):
-    def test_match_id_always_contains_game_id(self):
-        match_id = make_match_id("model-b", "model-a", 2,
-                                 "fox-in-the-forest")
+    def test_match_id_is_order_independent_and_contains_game_id(self):
+        with patch("main.time.strftime", return_value="20260807-000000"):
+            id_ab = make_match_id("model-b", "model-a", "fox-in-the-forest", 7)
+            id_ba = make_match_id("model-a", "model-b", "fox-in-the-forest", 7)
 
-        self.assertEqual(
-            match_id,
-            "fox-in-the-forest_model-a_vs_model-b_game2",
-        )
+        self.assertEqual(id_ab, id_ba)
+        self.assertTrue(id_ab.startswith("fox-in-the-forest_model-a_vs_model-b_"))
+        self.assertTrue(id_ab.endswith("_0007"))
 
     def test_different_games_have_different_match_ids(self):
-        fox = make_match_id("a", "b", 0, "fox-in-the-forest")
-        number = make_match_id("a", "b", 0, "number-decomposition")
+        fox = make_match_id("a", "b", "fox-in-the-forest", 1)
+        number = make_match_id("a", "b", "number-decomposition", 1)
 
         self.assertNotEqual(fox, number)
 
-    def test_completed_matches_require_matching_game_id(self):
+
+class SchedulerTests(unittest.TestCase):
+    def test_ratings_seeded_from_v1_baseline(self):
+        scheduler = MatchScheduler(
+            _models("Claude-Fable-5", "Brand-New-Model"),
+            ["fox-in-the-forest"], [], rng=random.Random(0),
+        )
+
+        self.assertAlmostEqual(scheduler.ratings["Claude-Fable-5"],
+                               V1_ELO["Claude-Fable-5"])
+        self.assertAlmostEqual(scheduler.ratings["Brand-New-Model"], DEFAULT_ELO)
+        # The new model has no prior games, so it is more uncertain.
+        self.assertGreater(scheduler.sigma("Brand-New-Model"),
+                           scheduler.sigma("Claude-Fable-5"))
+
+    def test_prior_results_update_live_ratings(self):
+        scheduler = MatchScheduler(
+            _models("a", "b"), ["fox-in-the-forest"],
+            [_result("a", "b", winner=0)],
+            rng=random.Random(0),
+        )
+
+        self.assertGreater(scheduler.ratings["a"], scheduler.ratings["b"])
+        self.assertEqual(scheduler.games_played["a"], 1)
+        self.assertEqual(scheduler.games_played["b"], 1)
+
+    def test_sample_match_returns_valid_task(self):
+        scheduler = MatchScheduler(
+            _models("a", "b", "c"), ["fox-in-the-forest", "number-decomposition"],
+            [], rng=random.Random(0),
+        )
+
+        task = scheduler.sample_match()
+
+        self.assertIn(task.game_id,
+                      ["fox-in-the-forest", "number-decomposition"])
+        self.assertNotEqual(task.model_a["name"], task.model_b["name"])
+        self.assertIn(task.model_a["name"], ["a", "b", "c"])
+        self.assertIn(task.model_b["name"], ["a", "b", "c"])
+
+    def test_uncertain_models_are_scheduled_more(self):
+        # "veteran" has many recorded games; "rookie" has none.
+        prior = [_result("veteran", "other", winner=0) for _ in range(30)]
+        scheduler = MatchScheduler(
+            _models("veteran", "other", "rookie"), ["fox-in-the-forest"],
+            prior, rng=random.Random(1),
+        )
+
+        counts = Counter()
+        for _ in range(300):
+            task = scheduler.sample_match()
+            counts[task.model_a["name"]] += 1
+            counts[task.model_b["name"]] += 1
+            scheduler.finish_match(task, None)
+
+        self.assertGreater(counts["rookie"], counts["veteran"])
+
+    def test_closer_elo_opponents_are_preferred(self):
+        # Big rating gaps: top ~1900, mid ~1880, bottom ~1200. All get equal
+        # pseudo-experience so pairing is driven by Elo distance only.
+        scheduler = MatchScheduler(
+            _models("top", "mid", "bottom"), ["fox-in-the-forest"], [],
+            rng=random.Random(2),
+        )
+        scheduler.ratings.update({"top": 1900.0, "mid": 1880.0, "bottom": 1200.0})
+        scheduler.prior_games.update({"top": 50, "mid": 50, "bottom": 50})
+
+        pair_counts = Counter()
+        for _ in range(300):
+            task = scheduler.sample_match()
+            pair = tuple(sorted([task.model_a["name"], task.model_b["name"]]))
+            pair_counts[pair] += 1
+            scheduler.finish_match(task, None)
+
+        self.assertGreater(pair_counts[("mid", "top")],
+                           pair_counts[("bottom", "top")])
+        self.assertGreater(pair_counts[("mid", "top")],
+                           pair_counts[("bottom", "mid")])
+
+    def test_games_stay_balanced(self):
+        scheduler = MatchScheduler(
+            _models("a", "b"),
+            ["fox-in-the-forest", "number-decomposition"], [],
+            rng=random.Random(3),
+        )
+
+        game_counts = Counter()
+        for _ in range(40):
+            task = scheduler.sample_match()
+            game_counts[task.game_id] += 1
+            scheduler.finish_match(
+                task, _result("a", "b", winner=0, game_id=task.game_id)
+            )
+
+        self.assertEqual(game_counts["fox-in-the-forest"], 20)
+        self.assertEqual(game_counts["number-decomposition"], 20)
+
+    def test_first_player_slot_is_balanced(self):
+        scheduler = MatchScheduler(
+            _models("a", "b"), ["fox-in-the-forest"], [],
+            rng=random.Random(4),
+        )
+
+        first_counts = Counter()
+        for _ in range(50):
+            task = scheduler.sample_match()
+            first_counts[task.model_a["name"]] += 1
+            scheduler.finish_match(
+                task, _result(task.model_a["name"], task.model_b["name"],
+                              winner=0)
+            )
+
+        self.assertEqual(first_counts["a"], 25)
+        self.assertEqual(first_counts["b"], 25)
+
+    def test_removed_model_is_not_scheduled_but_its_games_still_count(self):
+        prior = [_result("kept", "removed", winner=1)]
+        scheduler = MatchScheduler(
+            _models("kept", "other"), ["fox-in-the-forest"], prior,
+            rng=random.Random(5),
+        )
+
+        self.assertLess(scheduler.ratings["kept"], V1_ELO.get("kept", DEFAULT_ELO))
+        for _ in range(20):
+            task = scheduler.sample_match()
+            self.assertNotIn("removed",
+                             [task.model_a["name"], task.model_b["name"]])
+            scheduler.finish_match(task, None)
+
+    def test_aborted_match_does_not_change_ratings(self):
+        scheduler = MatchScheduler(
+            _models("a", "b"), ["fox-in-the-forest"], [],
+            rng=random.Random(6),
+        )
+        before = dict(scheduler.ratings)
+
+        task = scheduler.sample_match()
+        scheduler.finish_match(task, None)  # aborted (api_error) => no result
+
+        self.assertEqual(dict(scheduler.ratings), before)
+        self.assertEqual(sum(scheduler.in_flight_pairs.values()), 0)
+
+
+class LoadResultsTests(unittest.TestCase):
+    def test_results_are_ordered_by_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:
-            results = [
-                {"game_id": "number-decomposition", "match_id": "number-1"},
-                {"game_id": "fox-in-the-forest", "match_id": "fox-1"},
-                {"match_id": "missing-game"},
-            ]
-            for index, result in enumerate(results):
-                with open(os.path.join(directory, f"{index}.json"), "w",
+            newer = _result("a", "b", winner=0, timestamp=2000.0)
+            older = _result("a", "b", winner=1, timestamp=1000.0)
+            for name, result in [("newer.json", newer), ("older.json", older)]:
+                with open(os.path.join(directory, name), "w",
                           encoding="utf-8") as result_file:
                     json.dump(result, result_file)
 
-            completed = get_completed_matches(directory, ["number-decomposition"])
+            loaded = load_all_results(directory)
 
-        self.assertEqual(completed, {"number-1"})
-
-    def test_schedule_tasks_carry_their_game_id(self):
-        models = [
-            {"name": "a"},
-            {"name": "b"},
-        ]
-
-        tasks = build_match_schedule(
-            models, 1, set(), "number-decomposition"
-        )
-
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0].game_id, "number-decomposition")
-        self.assertTrue(tasks[0].match_id.startswith("number-decomposition_"))
-
-    def test_main_schedules_all_games_when_game_is_omitted(self):
-        captured_games = []
-
-        def capture_schedule(models, games_per_pair, completed, game_id):
-            captured_games.append(game_id)
-            return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            argv = [
-                "main.py", "--games", "1", "--results-dir", directory,
-                "--logs-dir", directory,
-            ]
-            with patch("sys.argv", argv), \
-                    patch("main.get_completed_matches", return_value=set()), \
-                    patch("main.build_match_schedule", side_effect=capture_schedule), \
-                    patch("main.print_summary"):
-                main.main()
-
-        self.assertEqual(captured_games, list(main.GAMES))
+        self.assertEqual([r["timestamp"] for r in loaded], [1000.0, 2000.0])
 
 
 class RunSingleMatchTests(unittest.TestCase):
@@ -148,6 +272,45 @@ class RunSingleMatchTests(unittest.TestCase):
         self.assertEqual(recorded["reason"], "forfeit")
         self.assertEqual(recorded["winner"], 1)
         self.assertEqual(recorded["match_id"], task.match_id)
+        self.assertIn("timestamp", recorded)
+
+
+class RunTournamentTests(unittest.TestCase):
+    def test_keyboard_interrupt_stops_run_and_keeps_recorded_results(self):
+        game = FakeGame({
+            "winner": 0,
+            "reason": "score",
+            "player_names": ["a", "b"],
+            "output_tokens": [0, 0],
+        })
+        scheduler = MatchScheduler(
+            _models("a", "b"), ["fox-in-the-forest"], [],
+            rng=random.Random(0),
+        )
+        # Simulate Ctrl+C when the 4th match would be scheduled.
+        original_sample = scheduler.sample_match
+        samples = {"count": 0}
+
+        def limited_sample():
+            if samples["count"] >= 3:
+                raise KeyboardInterrupt
+            samples["count"] += 1
+            return original_sample()
+
+        scheduler.sample_match = limited_sample
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("main.get_game", return_value=game), \
+                    patch("main.LLMPlayer"):
+                completed = main.run_tournament(
+                    scheduler, directory, directory, workers=1, verbose=False
+                )
+
+            recorded = [f for f in os.listdir(directory)
+                        if f.endswith(".json")]
+
+        self.assertEqual(completed, 3)
+        self.assertEqual(len(recorded), 3)
 
 
 if __name__ == "__main__":

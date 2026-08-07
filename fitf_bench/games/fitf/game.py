@@ -6,6 +6,9 @@ from typing import List, Optional, Tuple, Dict
 
 from fitf_bench.games.fitf.cards import Card, Suit, create_deck, format_hand
 
+# Score needed to end the game (v2: lowered from 35 to shorten games).
+WINNING_SCORE = 21
+
 
 @dataclass
 class TrickResult:
@@ -358,7 +361,7 @@ class GameEngine:
             "total_scores": [self.scores[0], self.scores[1]],
         }
 
-        if self.scores[0] >= 35 or self.scores[1] >= 35:
+        if self.scores[0] >= WINNING_SCORE or self.scores[1] >= WINNING_SCORE:
             self.game_over = True
             if self.scores[0] > self.scores[1]:
                 self.winner = 0
@@ -397,7 +400,8 @@ class GameEngine:
         lines.append(f"Round: {rs.round_number} | Trick: {rs.trick_number}/13")
         lines.append(f"Trump suit: {rs.trump_suit.value} (Decree card: {rs.decree_card})")
         lines.append(f"Tricks won - You: {rs.tricks_won[player]}, Opponent: {rs.tricks_won[1-player]}")
-        lines.append(f"Scores - You: {self.scores[player]}, Opponent: {self.scores[1-player]}")
+        lines.append(f"Scores - You: {self.scores[player]}, Opponent: {self.scores[1-player]} "
+                     f"(game ends at {WINNING_SCORE}+ points)")
         if rs.current_leader == player:
             lines.append(f"You are leading this trick.")
         else:

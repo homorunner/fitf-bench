@@ -10,15 +10,21 @@ from fitf_bench.llm_player import LLMPlayer
 
 FIRST_PLAYER_TURN_LIMIT = 16
 
+# v2: starting number range narrowed from 2-100 to 10-90 to shorten rounds
+# and reduce the first-player advantage.
+MIN_STARTING_NUMBER = 10
+MAX_STARTING_NUMBER = 90
+
 CHOOSE_NUMBER_TOOL = {
     "type": "function",
     "function": {
         "name": "choose_number",
-        "description": "Secretly choose your starting number for this round.",
+        "description": "Secretly choose your starting number for this game.",
         "parameters": {
             "type": "object",
             "properties": {
-                "number": {"type": "integer", "minimum": 2, "maximum": 100},
+                "number": {"type": "integer", "minimum": MIN_STARTING_NUMBER,
+                           "maximum": MAX_STARTING_NUMBER},
             },
             "required": ["number"],
         },
@@ -95,8 +101,6 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
     def __init__(self, player1: LLMPlayer, player2: LLMPlayer,
                  verbose: bool = True, seed: Optional[Any] = None):
         super().__init__(player1, player2, verbose=verbose, seed=seed)
-        self.round_wins = [0, 0]
-        self.round_number = 0
         self.state: Optional[RoundState] = None
 
     def run_game(self) -> Dict[str, Any]:
@@ -105,38 +109,21 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
             player.reset_for_new_game()
             player.send_rules(rules)
 
-        round_winners = []
-        while max(self.round_wins) < 2 and not self.stopped:
-            winner = self._run_round()
-            if winner is not None:
-                self.round_wins[winner] += 1
-                round_winners.append(winner)
-                message = (f"Round {self.round_number} winner: Player {winner + 1}. "
-                           f"Match score: {self.round_wins[0]}-{self.round_wins[1]}.")
-                self.log(message)
-                self.broadcast_log(message)
+        winner = self._run_round()
+
+        turns_taken = self.state.turns_taken.copy() if self.state else [0, 0]
 
         if self.stopped:
-            return self.build_stopped_result(
-                scores=self.round_wins.copy(),
-                rounds_played=self.round_number,
-                round_winners=round_winners,
-            )
+            return self.build_stopped_result(turns_taken=turns_taken)
 
-        winner = 0 if self.round_wins[0] == 2 else 1
-        reason = "rounds"
+        message = f"Player {winner + 1} wins the game."
+        self.log(message)
+        self.broadcast_log(message)
 
-        return self.build_result(
-            winner,
-            reason,
-            scores=self.round_wins.copy(),
-            rounds_played=self.round_number,
-            round_winners=round_winners,
-        )
+        return self.build_result(winner, "win", turns_taken=turns_taken)
 
     def _run_round(self) -> Optional[int]:
-        self.round_number += 1
-        self.broadcast_log(f"Round {self.round_number} begins. Player 1 acts first.")
+        self.broadcast_log("The game begins. Player 1 acts first.")
 
         numbers = []
         for player_id in (0, 1):
@@ -148,7 +135,7 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
         self.state = RoundState(numbers=numbers, lies_available=[True, True])
         for player_id, number in enumerate(numbers):
             self.players[player_id].add_log(
-                f"Your secret starting number for round {self.round_number}: {number}."
+                f"Your secret starting number: {number}."
             )
 
         while not self.stopped:
@@ -158,10 +145,9 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
         return None
 
     def _choose_number(self, player_id: int) -> Optional[int]:
-        state = (f"== Current State ==\nRound: {self.round_number}\n"
-                 f"Match score: You {self.round_wins[player_id]} - "
-                 f"Opponent {self.round_wins[1 - player_id]}")
-        action = "Choose your secret starting integer from 2 to 100."
+        state = "== Current State ==\nThe game is about to begin."
+        action = (f"Choose your secret starting integer from "
+                  f"{MIN_STARTING_NUMBER} to {MAX_STARTING_NUMBER}.")
 
         def attempt(first: bool):
             arguments, error = self.players[player_id].request_action(
@@ -170,9 +156,11 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
             if error:
                 return None, error
             number = arguments.get("number")
-            if isinstance(number, int) and not isinstance(number, bool) and 2 <= number <= 100:
+            if (isinstance(number, int) and not isinstance(number, bool)
+                    and MIN_STARTING_NUMBER <= number <= MAX_STARTING_NUMBER):
                 return number, ""
-            return None, "The starting number must be an integer from 2 to 100."
+            return None, (f"The starting number must be an integer from "
+                          f"{MIN_STARTING_NUMBER} to {MAX_STARTING_NUMBER}.")
 
         number, ok = self.request_with_retries(player_id, "choose_number", attempt)
         return number if ok else None
@@ -202,7 +190,7 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
 
         operation_text = "subtracts" if operation == "subtract" else "divides by"
         result_text = "success" if announced_success else "failure"
-        message = (f"[Round {self.round_number}, Turn {state.turn}] Player {attacker + 1} "
+        message = (f"[Turn {state.turn}] Player {attacker + 1} "
                    f"{operation_text} {number}: {result_text}.")
         self.log(message)
         self.broadcast_log(message)
@@ -212,8 +200,8 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
             return attacker
         if (attacker == 0
                 and state.turns_taken[0] == FIRST_PLAYER_TURN_LIMIT):
-            message = (f"Player 1 did not win on their 16th turn. "
-                       f"Player 2 wins round {self.round_number}.")
+            message = ("Player 1 did not win on their 16th turn. "
+                       "Player 2 wins the game.")
             self.log(message)
             self.broadcast_log(message)
             return 1
@@ -276,9 +264,7 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
     def _format_state(self, player_id: int, situation: str) -> str:
         state = self.state
         lie_status = "available" if state.lies_available[player_id] else "used"
-        return (f"== Current State ==\nRound: {self.round_number}\nTurn: {state.turn}\n"
-                f"Match score: You {self.round_wins[player_id]} - "
-                f"Opponent {self.round_wins[1 - player_id]}\n"
+        return (f"== Current State ==\nTurn: {state.turn}\n"
                 f"Turns taken: You {state.turns_taken[player_id]} - "
                 f"Opponent {state.turns_taken[1 - player_id]}\n"
                 f"Your current number: {state.numbers[player_id]}\n"

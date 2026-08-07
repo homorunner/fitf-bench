@@ -1,15 +1,15 @@
 # Two-Player Game LLM Benchmark
 
-A benchmark that evaluates LLMs in round-robin tournaments across two-player text games.
+A benchmark that evaluates LLMs across two-player text games using continuous matchmaking (v2).
 
 ## Usage
 
 ```bash
-python main.py              # Run tournament
-python elo.py               # Compute Elo ratings
+python main.py --workers 16        # Run continuous matchmaking (Ctrl+C to stop)
+python elo.py                      # Compute Elo ratings (seeded from v1 baseline)
 ```
 
-Configure models in `main.py` `MODELS` list. Supports parallel execution, deterministic seeds, and auto-resume.
+Configure models in `main.py`.
 
 ## Adding a Game
 
@@ -23,7 +23,9 @@ New games use the shared `TwoPlayerGameRunner` and `LLMPlayer.request_action()` 
 The tournament runner, model setup, API logging, retries, and result metadata are shared across games.
 Use `python main.py --game <game-id>` and `python elo.py --game <game-id>` to run and analyze a registered game.
 
-## Results
+## V1 Results (archived)
+
+Final Elo standings from the v1 tournament (see git tag `v1`).
 
 ### Elo Ratings
 

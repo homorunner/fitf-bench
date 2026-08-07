@@ -111,9 +111,9 @@ After all 13 tricks have been played, count how many tricks each player has won.
 
 ## 游戏结束 End of Game
 
-轮末计分后，若任一玩家累计达到至少35分，则游戏立即结束。否则，开始下一轮（由当前轮非发牌员担任下一轮发牌员）。继续进行完整轮次，直到有玩家达到35分或以上。最终总分最高者获胜；若总分平局，则比较最后一轮中双方仅按赢墩数获得的基础分（不含7号宝藏的奖励分），基础分较高者获胜。
+轮末计分后，若任一玩家累计达到至少21分，则游戏立即结束。否则，开始下一轮（由当前轮非发牌员担任下一轮发牌员）。继续进行完整轮次，直到有玩家达到21分或以上。最终总分最高者获胜；若总分平局，则比较最后一轮中双方仅按赢墩数获得的基础分（不含7号宝藏的奖励分），基础分较高者获胜。
 
-After end-of-round scoring, if either player has at least 35 points, the game is over. Otherwise, play another round (with the dealer alternating). Continue until either player has at least 35 points. The player with the most points wins. If the total scores are tied, compare only the last round's base points from tricks won, excluding Treasure bonus points; the player with more base points wins.
+After end-of-round scoring, if either player has at least 21 points, the game is over. Otherwise, play another round (with the dealer alternating). Continue until either player has at least 21 points. The player with the most points wins. If the total scores are tied, compare only the last round's base points from tricks won, excluding Treasure bonus points; the player with more base points wins.
 
 ---
 

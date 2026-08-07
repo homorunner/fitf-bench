@@ -1,28 +1,53 @@
-"""Round-robin tournament for two-player LLM game benchmarks.
+"""Continuous Elo-driven matchmaking for two-player LLM game benchmarks (v2).
 
-Defines a set of LLM models and runs a full round-robin tournament where each
-pair of models plays k games. Supports:
-- Fixed random seeds for reproducibility (seed derived from matchup + game index)
-- Resume from previous runs (skips already-completed matches found in results/)
-- Parallel execution via concurrent.futures
+Matches are sampled continuously:
+- Models with higher rating uncertainty (fewer games played) are picked more
+  often, so new models converge quickly.
+- Opponents are chosen with probability decaying in Elo distance, so matches
+  are mostly played between models of similar strength (more informative).
+- A fixed parallelism (--workers) is kept saturated; the run continues until
+  the process is interrupted (Ctrl+C).
+
+Ratings are seeded from the archived v1 standings (initial_elo.V1_ELO); models
+without a v1 baseline start at the default rating with high uncertainty, which
+automatically prioritizes them. Removing a model from MODELS simply stops
+scheduling it; its recorded games still influence other models' ratings.
+
+Every finished match is written to results/ immediately, so interrupting and
+restarting is always safe: prior results are replayed on startup to restore the
+live ratings.
 """
 
 import argparse
 import json
+import math
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+import threading
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from itertools import combinations
-from typing import List, Dict, Optional
-
-from tqdm import tqdm
+from typing import Dict, List, Optional
 
 from fitf_bench import GAMES, LLMPlayer, get_game
+from initial_elo import DEFAULT_ELO, V1_ELO
 
-GAMES_PER_PAIR = 5
 MAX_WORKERS = 8
 RESULTS_DIR = "results"
 LOGS_DIR = "logs"
+
+# Online Elo K-factor used for the scheduler's live ratings.
+ELO_K = 32.0
+# Rating uncertainty (sigma) of a brand-new model.
+SIGMA_INIT = 350.0
+SIGMA_MIN = 60.0
+# Pseudo-games credited to models that carry a v1 baseline rating.
+PRIOR_GAMES_V1 = 10
+# Elo-distance scale for opponent selection.
+PAIRING_SCALE = 200.0
+# Print live standings every N completed matches.
+STANDINGS_EVERY = 10
 
 MODELS: List[Dict[str, str]] = [
     {
@@ -79,41 +104,6 @@ MODELS: List[Dict[str, str]] = [
     },
 ]
 
-# ===========================================================================
-# MATCH ID AND RESUME LOGIC
-# ===========================================================================
-
-def make_match_id(model_a_name: str, model_b_name: str, game_index: int,
-                  game_id: str) -> str:
-    """Create a deterministic match ID from the two model names and game index.
-    
-    The match ID is independent of player order (alphabetically sorted names),
-    so A-vs-B game 1 and B-vs-A game 1 produce the same ID.
-    """
-    names = sorted([model_a_name, model_b_name])
-    return f"{game_id}_{names[0]}_vs_{names[1]}_game{game_index}"
-
-
-def get_completed_matches(results_dir: str, game_ids) -> set:
-    """Scan results directory and return set of completed match IDs."""
-    completed = set()
-    selected_games = set(game_ids)
-    if not os.path.isdir(results_dir):
-        return completed
-    for filename in os.listdir(results_dir):
-        if not filename.endswith(".json"):
-            continue
-        filepath = os.path.join(results_dir, filename)
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            match_id = data.get("match_id")
-            if data.get("game_id") in selected_games and match_id:
-                completed.add(match_id)
-        except (json.JSONDecodeError, OSError):
-            continue
-    return completed
-
 
 # ===========================================================================
 # SINGLE MATCH EXECUTION
@@ -125,9 +115,15 @@ class MatchTask:
     model_a: Dict[str, str]
     model_b: Dict[str, str]
     game_id: str
-    game_index: int
     match_id: str
     seed: str
+
+
+def make_match_id(model_a_name: str, model_b_name: str, game_id: str,
+                  sequence: int) -> str:
+    names = sorted([model_a_name, model_b_name])
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"{game_id}_{names[0]}_vs_{names[1]}_{stamp}_{sequence:04d}"
 
 
 def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
@@ -169,19 +165,19 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         return None
 
     if result.get("reason") == "api_error":
-        # Infrastructure failure: nobody's fault, don't record, replay later.
+        # Infrastructure failure: nobody's fault, don't record.
         failed = result["player_names"][result["api_error_player"]]
         print(f"[ABORT] {task.match_id}: repeated API errors for {failed} "
-              f"(not recorded, will be replayed)")
+              f"(not recorded)")
         return None
 
     # Enrich result with tournament metadata
     result["match_id"] = task.match_id
     result["seed"] = task.seed
-    result["game_index"] = task.game_index
     result["model_a"] = task.model_a["name"]
     result["model_b"] = task.model_b["name"]
     result["game_id"] = task.game_id
+    result["timestamp"] = time.time()
 
     # Write result
     with open(result_path, "w", encoding="utf-8") as f:
@@ -198,64 +194,179 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
 
 
 # ===========================================================================
-# TOURNAMENT ORCHESTRATION
+# ELO-DRIVEN MATCHMAKING
 # ===========================================================================
 
-def build_match_schedule(models: List[Dict[str, str]], games_per_pair: int,
-                         completed: set, game_id: str) -> List[MatchTask]:
-    """Build list of matches to run, skipping already-completed ones.
-    
-    For each pair (A, B), we play `games_per_pair` games. In even-indexed games
-    (0, 2, 4, ...) model_a is player 1; in odd-indexed games (1, 3, 5, ...)
-    model_b is player 1. This ensures each model gets roughly equal first-player
-    opportunities (though actual first move is determined by the seed/RNG).
-    """
-    tasks = []
-    for model_a, model_b in combinations(models, 2):
-        for game_idx in range(games_per_pair):
-            match_id = make_match_id(
-                model_a["name"], model_b["name"], game_idx, game_id
+def sigma_for(games: float) -> float:
+    """Rating uncertainty as a function of (effective) games played."""
+    return max(SIGMA_MIN, SIGMA_INIT / math.sqrt(1.0 + games))
+
+
+def _weighted_choice(rng: random.Random, items: List, weights: List[float]):
+    total = sum(weights)
+    if total <= 0:
+        return rng.choice(items)
+    point = rng.random() * total
+    cumulative = 0.0
+    for item, weight in zip(items, weights):
+        cumulative += weight
+        if cumulative >= point:
+            return item
+    return items[-1]
+
+
+def load_all_results(results_dir: str) -> List[Dict]:
+    entries = []
+    if not os.path.isdir(results_dir):
+        return []
+    for filename in os.listdir(results_dir):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(results_dir, filename)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            order = data.get("timestamp") or os.path.getmtime(filepath)
+            entries.append((order, data))
+        except (json.JSONDecodeError, OSError):
+            continue
+    entries.sort(key=lambda pair: pair[0])
+    return [data for _, data in entries]
+
+
+class MatchScheduler:
+    def __init__(self, models: List[Dict[str, str]], game_ids: List[str],
+                 prior_results: List[Dict], rng: Optional[random.Random] = None):
+        if len(models) < 2:
+            raise ValueError("Need at least two models to schedule matches.")
+        self.models = {m["name"]: m for m in models}
+        self.game_ids = list(game_ids)
+        self.rng = rng or random.Random()
+        self._lock = threading.Lock()
+        self._sequence = 0
+
+        self.ratings: Dict[str, float] = defaultdict(lambda: DEFAULT_ELO)
+        self.prior_games: Dict[str, int] = {}
+        self.games_played: Counter = Counter()
+        self.first_played: Counter = Counter()
+        self.game_match_counts: Counter = Counter()
+        self.in_flight_pairs: Counter = Counter()
+        self.in_flight_games: Counter = Counter()
+
+        for name in self.models:
+            self.ratings[name] = V1_ELO.get(name, DEFAULT_ELO)
+            self.prior_games[name] = PRIOR_GAMES_V1 if name in V1_ELO else 0
+
+        for result in prior_results:
+            self._apply_result(result)
+
+    def effective_games(self, name: str) -> float:
+        return self.prior_games.get(name, 0) + self.games_played[name]
+
+    def sigma(self, name: str) -> float:
+        return sigma_for(self.effective_games(name))
+
+    def _apply_result(self, result: Dict):
+        names = result.get("player_names", [])
+        winner = result.get("winner")
+        if len(names) != 2 or winner not in (0, 1):
+            return
+        name_a, name_b = names
+        if name_a not in self.ratings:
+            self.ratings[name_a] = V1_ELO.get(name_a, DEFAULT_ELO)
+        if name_b not in self.ratings:
+            self.ratings[name_b] = V1_ELO.get(name_b, DEFAULT_ELO)
+        rating_a, rating_b = self.ratings[name_a], self.ratings[name_b]
+        expected_a = 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
+        score_a = 1.0 if winner == 0 else 0.0
+        self.ratings[name_a] = rating_a + ELO_K * (score_a - expected_a)
+        self.ratings[name_b] = rating_b + ELO_K * ((1.0 - score_a) - (1.0 - expected_a))
+        self.games_played[name_a] += 1
+        self.games_played[name_b] += 1
+        self.first_played[name_a] += 1
+        game_id = result.get("game_id")
+        if game_id in self.game_ids:
+            self.game_match_counts[game_id] += 1
+
+    @staticmethod
+    def _pair_key(name_a: str, name_b: str) -> tuple:
+        return tuple(sorted((name_a, name_b)))
+
+    def sample_match(self) -> MatchTask:
+        with self._lock:
+            names = list(self.models)
+
+            # 1. Pick the model most in need of games: weight = variance.
+            first_weights = [self.sigma(name) ** 2 for name in names]
+            picked = _weighted_choice(self.rng, names, first_weights)
+
+            # 2. Pick an opponent: closer Elo => higher weight; uncertain
+            #    opponents preferred; pairs already in flight are penalized.
+            opponents = [name for name in names if name != picked]
+            opponent_weights = []
+            for name in opponents:
+                distance = self.ratings[picked] - self.ratings[name]
+                proximity = math.exp(-0.5 * (distance / PAIRING_SCALE) ** 2)
+                uncertainty = self.sigma(name)
+                repeat_penalty = 1.0 / (1.0 + self.in_flight_pairs[self._pair_key(picked, name)])
+                opponent_weights.append(proximity * uncertainty * repeat_penalty)
+            opponent = _weighted_choice(self.rng, opponents, opponent_weights)
+
+            # 3. Pick the least-played game to keep games balanced.
+            game_id = min(
+                self.game_ids,
+                key=lambda g: (self.game_match_counts[g] + self.in_flight_games[g],
+                               self.rng.random()),
             )
-            if match_id in completed:
-                continue
-            seed = str(game_idx)
-            # Alternate who is player 1 vs player 2
-            if game_idx % 2 == 0:
-                p1, p2 = model_a, model_b
+
+            # 4. Balance who plays first (player 1).
+            if self.first_played[picked] <= self.first_played[opponent]:
+                model_a, model_b = self.models[picked], self.models[opponent]
             else:
-                p1, p2 = model_b, model_a
-            tasks.append(MatchTask(
-                model_a=p1,
-                model_b=p2,
+                model_a, model_b = self.models[opponent], self.models[picked]
+
+            self._sequence += 1
+            match_id = make_match_id(picked, opponent, game_id, self._sequence)
+            seed = str(self.rng.randrange(2 ** 31))
+
+            self.in_flight_pairs[self._pair_key(picked, opponent)] += 1
+            self.in_flight_games[game_id] += 1
+
+            return MatchTask(
+                model_a=model_a,
+                model_b=model_b,
                 game_id=game_id,
-                game_index=game_idx,
                 match_id=match_id,
                 seed=seed,
-            ))
-    return tasks
+            )
 
+    def finish_match(self, task: MatchTask, result: Optional[Dict]):
+        with self._lock:
+            pair = self._pair_key(task.model_a["name"], task.model_b["name"])
+            if self.in_flight_pairs[pair] > 0:
+                self.in_flight_pairs[pair] -= 1
+            if self.in_flight_games[task.game_id] > 0:
+                self.in_flight_games[task.game_id] -= 1
+            if result is not None:
+                self._apply_result(result)
 
-def _load_all_results(results_dir: str, game_id: str) -> List[Dict]:
-    all_results = []
-    if os.path.isdir(results_dir):
-        for filename in os.listdir(results_dir):
-            if not filename.endswith(".json"):
-                continue
-            filepath = os.path.join(results_dir, filename)
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    result = json.load(f)
-                if result.get("game_id") == game_id:
-                    all_results.append(result)
-            except (json.JSONDecodeError, OSError):
-                continue
-    return all_results
+    def format_standings(self) -> str:
+        with self._lock:
+            lines = ["  Live Elo (scheduler estimate):"]
+            ranked = sorted(self.models, key=lambda n: self.ratings[n], reverse=True)
+            for rank, name in enumerate(ranked, 1):
+                lines.append(
+                    f"  {rank:<3} {name:<25} {self.ratings[name]:>7.1f} "
+                    f"(sigma {self.sigma(name):>5.1f}, v2 games {self.games_played[name]})"
+                )
+        return "\n".join(lines)
 
 
 def print_summary(results_dir: str, models: List[Dict[str, str]], game_id: str):
-    all_results = _load_all_results(results_dir, game_id)
+    all_results = [r for r in load_all_results(results_dir)
+                   if r.get("game_id") == game_id]
     if not all_results:
-        print("\nNo results found.")
+        print(f"\nNo results found for {game_id}.")
         return
 
     # Build stats per model
@@ -299,6 +410,42 @@ def print_summary(results_dir: str, models: List[Dict[str, str]], game_id: str):
     print("=" * 70)
 
 
+def run_tournament(scheduler: MatchScheduler, results_dir: str, logs_dir: str,
+                   workers: int, verbose: bool) -> int:
+    completed = 0
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures: Dict = {}
+    try:
+        while True:
+            while len(futures) < workers:
+                task = scheduler.sample_match()
+                future = executor.submit(
+                    run_single_match, task, results_dir, logs_dir, verbose
+                )
+                futures[future] = task
+                print(f"[MATCH] {task.match_id} "
+                      f"({task.model_a['name']} vs {task.model_b['name']})")
+
+            done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                task = futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print(f"[ERROR] {task.match_id} raised: {e}")
+                    result = None
+                scheduler.finish_match(task, result)
+                if result is not None:
+                    completed += 1
+                    if completed % STANDINGS_EVERY == 0:
+                        print(f"\n[PROGRESS] {completed} match(es) recorded this run.")
+                        print(scheduler.format_standings() + "\n")
+    except KeyboardInterrupt:
+        print(f"\n[INTERRUPT] Stopping: no new matches will be scheduled. "
+              f"{len(futures)} match(es) still in flight are abandoned; "
+              f"completed matches are already saved and will be picked up on restart.")
+        executor.shutdown(wait=False, cancel_futures=True)
+    return completed
 
 
 def main():
@@ -307,14 +454,14 @@ def main():
     )
     parser.add_argument("--game", choices=GAMES,
                         help="Game to run (default: all registered games)")
-    parser.add_argument("--games", type=int, default=GAMES_PER_PAIR,
-                        help=f"Number of games per model pair (default: {GAMES_PER_PAIR})")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS,
-                        help=f"Max parallel workers (default: {MAX_WORKERS})")
+                        help=f"Parallel matches to keep in flight (default: {MAX_WORKERS})")
     parser.add_argument("--results-dir", type=str, default=RESULTS_DIR,
                         help=f"Results directory (default: {RESULTS_DIR})")
     parser.add_argument("--logs-dir", type=str, default=LOGS_DIR,
                         help=f"Logs directory (default: {LOGS_DIR})")
+    parser.add_argument("--seed", type=int, default=1437,
+                        help="Random seed for the matchmaking sampler")
     parser.add_argument("--verbose", action="store_true",
                         help="Print detailed game output")
     parser.add_argument("--summary-only", action="store_true",
@@ -334,63 +481,26 @@ def main():
             print_summary(results_dir, MODELS, game_id)
         return
 
-    # Resume: find completed matches
-    completed = get_completed_matches(results_dir, selected_games)
-    if completed:
-        print(f"[RESUME] Found {len(completed)} completed match(es), skipping them.")
+    prior_results = load_all_results(results_dir)
+    if prior_results:
+        print(f"[RESUME] Replayed {len(prior_results)} prior result(s) "
+              f"to restore live ratings.")
 
-    # Build schedule
-    tasks = []
-    for game_id in selected_games:
-        tasks.extend(build_match_schedule(
-            MODELS, args.games, completed, game_id
-        ))
-    total_possible = (len(list(combinations(MODELS, 2))) * args.games
-                      * len(selected_games))
-    print(f"[SCHEDULE] {len(tasks)} match(es) to run "
-          f"({total_possible - len(tasks)} already completed, {total_possible} total)")
+    scheduler = MatchScheduler(
+        MODELS, selected_games, prior_results,
+        rng=random.Random(args.seed),
+    )
+    print(scheduler.format_standings())
+    print(f"\n[START] Continuous matchmaking with {args.workers} worker(s). "
+          f"Press Ctrl+C to stop.\n")
 
-    if not tasks:
-        print("[DONE] All matches already completed.")
-        for game_id in selected_games:
-            print_summary(results_dir, MODELS, game_id)
-        return
+    completed = run_tournament(
+        scheduler, results_dir, logs_dir,
+        workers=args.workers, verbose=args.verbose,
+    )
 
-    # Run matches
-    results = []
-    if args.workers <= 1:
-        # Sequential execution
-        for task in tqdm(tasks, desc="Matches", unit="game"):
-            result = run_single_match(task, results_dir, logs_dir,
-                                      args.verbose)
-            if result:
-                results.append(result)
-    else:
-        # Parallel execution
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            future_to_task = {}
-            for task in tasks:
-                future = executor.submit(
-                    run_single_match, task, results_dir, logs_dir,
-                    args.verbose
-                )
-                future_to_task[future] = task
-
-            with tqdm(total=len(tasks), desc="Matches", unit="game") as pbar:
-                for future in as_completed(future_to_task):
-                    task = future_to_task[future]
-                    try:
-                            result = future.result()
-                            if result:
-                                results.append(result)
-                                winner_name = result["player_names"][result["winner"]]
-                                pbar.set_postfix_str(
-                                    f"{task.match_id}: {winner_name}")
-                    except Exception as e:
-                        pbar.write(f"[ERROR] {task.match_id} raised: {e}")
-                    pbar.update(1)
-
-    print(f"\n[COMPLETE] {len(results)} match(es) finished this run.")
+    print(f"\n[COMPLETE] {completed} match(es) finished this run.")
+    print(scheduler.format_standings())
     for game_id in selected_games:
         print_summary(results_dir, MODELS, game_id)
 
