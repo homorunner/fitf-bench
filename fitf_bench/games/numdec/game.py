@@ -1,8 +1,9 @@
 """Number Decomposition game and LLM runner."""
 
+import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fitf_bench.base import TwoPlayerGameRunner
 from fitf_bench.llm_player import LLMPlayer
@@ -14,6 +15,9 @@ FIRST_PLAYER_TURN_LIMIT = 16
 # and reduce the first-player advantage.
 MIN_STARTING_NUMBER = 10
 MAX_STARTING_NUMBER = 90
+
+# Number of recent games shown when choosing number.
+RECENT_GAMES_LIMIT = 20
 
 CHOOSE_NUMBER_TOOL = {
     "type": "function",
@@ -99,9 +103,12 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
     game_id = "number-decomposition"
 
     def __init__(self, player1: LLMPlayer, player2: LLMPlayer,
-                 verbose: bool = True, seed: Optional[Any] = None):
-        super().__init__(player1, player2, verbose=verbose, seed=seed)
+                 verbose: bool = True, seed: Optional[Any] = None,
+                 results_dir: Optional[str] = None):
+        super().__init__(player1, player2, verbose=verbose, seed=seed,
+                         results_dir=results_dir)
         self.state: Optional[RoundState] = None
+        self.starting_numbers: List[int] = []
 
     def run_game(self) -> Dict[str, Any]:
         rules = load_rules()
@@ -114,24 +121,34 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
         turns_taken = self.state.turns_taken.copy() if self.state else [0, 0]
 
         if self.stopped:
-            return self.build_stopped_result(turns_taken=turns_taken)
+            return self.build_stopped_result(
+                turns_taken=turns_taken,
+                starting_numbers=self.starting_numbers.copy(),
+            )
 
         message = f"Player {winner + 1} wins the game."
         self.log(message)
         self.broadcast_log(message)
 
-        return self.build_result(winner, "win", turns_taken=turns_taken)
+        return self.build_result(
+            winner, "win",
+            turns_taken=turns_taken,
+            starting_numbers=self.starting_numbers.copy(),
+        )
 
     def _run_round(self) -> Optional[int]:
         self.broadcast_log("The game begins. Player 1 acts first.")
 
+        history = self._format_recent_games()
+
         numbers = []
         for player_id in (0, 1):
-            number = self._choose_number(player_id)
+            number = self._choose_number(player_id, history)
             if number is None:
                 return None
             numbers.append(number)
 
+        self.starting_numbers = numbers.copy()
         self.state = RoundState(numbers=numbers, lies_available=[True, True])
         for player_id, number in enumerate(numbers):
             self.players[player_id].add_log(
@@ -144,8 +161,62 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
                 return winner
         return None
 
-    def _choose_number(self, player_id: int) -> Optional[int]:
-        state = "== Current State ==\nThe game is about to begin."
+    def _load_recent_games(self) -> List[Tuple[List[int], List[int], int]]:
+        """Load starting numbers, turns taken, and winner of recent games.
+
+        Returns up to RECENT_GAMES_LIMIT entries from the results directory
+        (any players), most recent first.
+        """
+        if not self.results_dir or not os.path.isdir(self.results_dir):
+            return []
+        entries = []
+        for filename in os.listdir(self.results_dir):
+            if not filename.endswith(".json"):
+                continue
+            path = os.path.join(self.results_dir, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as result_file:
+                    data = json.load(result_file)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("game_id") != self.game_id:
+                continue
+            if data.get("reason") != "win":
+                continue
+            numbers = data.get("starting_numbers")
+            turns = data.get("turns_taken")
+            winner = data.get("winner")
+            if (not isinstance(numbers, list) or len(numbers) != 2
+                    or not isinstance(turns, list) or len(turns) != 2
+                    or winner not in (0, 1)):
+                continue
+            order = data.get("timestamp") or os.path.getmtime(path)
+            entries.append((order, numbers, turns, winner))
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+        return [(numbers, turns, winner)
+                for _, numbers, turns, winner in entries[:RECENT_GAMES_LIMIT]]
+
+    def _format_recent_games(self) -> str:
+        recent = self._load_recent_games()
+        if not recent:
+            return ("")
+        lines = [
+            "== Recent Games ==",
+            f"The last {len(recent)} recorded game(s) between various players, "
+            "most recent first (starting numbers, turns taken, and winner):",
+        ]
+        for index, (numbers, turns, winner) in enumerate(recent, 1):
+            winner_text = "first player won" if winner == 0 else "second player won"
+            lines.append(
+                f"{index}. first player started at {numbers[0]}, "
+                f"second at {numbers[1]}; turns taken {turns[0]}-{turns[1]}; "
+                f"{winner_text}"
+            )
+        return "\n".join(lines)
+
+    def _choose_number(self, player_id: int, history: str) -> Optional[int]:
+        state = (f"== Current State ==\nThe game is about to begin.\n\n"
+                 f"{history}")
         action = (f"Choose your secret starting integer from "
                   f"{MIN_STARTING_NUMBER} to {MAX_STARTING_NUMBER}.")
 

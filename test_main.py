@@ -48,7 +48,7 @@ class FakeGame:
     def __init__(self, result):
         self._result = result
 
-    def create_runner(self, player1, player2, verbose, seed):
+    def create_runner(self, player1, player2, verbose, seed, results_dir=None):
         result = self._result
 
         class Runner:

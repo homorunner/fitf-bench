@@ -16,10 +16,13 @@ class TwoPlayerGameRunner(ABC):
     game_id: str
 
     def __init__(self, player1: LLMPlayer, player2: LLMPlayer,
-                 verbose: bool = True, seed: Optional[Any] = None):
+                 verbose: bool = True, seed: Optional[Any] = None,
+                 results_dir: Optional[str] = None):
         self.players = [player1, player2]
         self.verbose = verbose
         self.seed = seed
+        # Directory of recorded results; games may use it for historical stats.
+        self.results_dir = results_dir
         # Player who wins because the opponent forfeited (model errors).
         self.forfeit_winner: Optional[int] = None
         # Player whose API failed repeatedly; the match is aborted (no winner).

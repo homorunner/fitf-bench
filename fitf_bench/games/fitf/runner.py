@@ -21,8 +21,10 @@ class GameRunner(TwoPlayerGameRunner):
     game_id = "fox-in-the-forest"
 
     def __init__(self, player1: LLMPlayer, player2: LLMPlayer,
-                 verbose: bool = True, seed: Optional[int] = None):
-        super().__init__(player1, player2, verbose=verbose, seed=seed)
+                 verbose: bool = True, seed: Optional[int] = None,
+                 results_dir: Optional[str] = None):
+        super().__init__(player1, player2, verbose=verbose, seed=seed,
+                         results_dir=results_dir)
         self.engine = GameEngine(seed=seed)
 
     def run_game(self) -> dict:

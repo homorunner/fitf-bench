@@ -196,6 +196,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["winner"], 0)
         self.assertEqual(result["reason"], "win")
         self.assertEqual(result["turns_taken"], [1, 0])
+        self.assertEqual(result["starting_numbers"], [10, 10])
         self.assertIn("Player 1 acts first", player0.logs[0])
         self.assertEqual(player0.actions, [])
         self.assertEqual(player1.actions, [])

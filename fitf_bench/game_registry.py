@@ -14,8 +14,10 @@ class GameDefinition:
     name: str
     runner_class: Type[TwoPlayerGameRunner]
 
-    def create_runner(self, player1, player2, *, verbose: bool, seed):
-        return self.runner_class(player1, player2, verbose=verbose, seed=seed)
+    def create_runner(self, player1, player2, *, verbose: bool, seed,
+                      results_dir=None):
+        return self.runner_class(player1, player2, verbose=verbose, seed=seed,
+                                 results_dir=results_dir)
 
 
 GAMES: Dict[str, GameDefinition] = {
