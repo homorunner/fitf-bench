@@ -34,7 +34,8 @@ def load_results(results_dir: str,
             if (("player_names" in data) and ("winner" in data)
                     and (game_id == "all" or data.get("game_id") == game_id)):
                 results.append(data)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[WARN] Skipping unreadable result {filepath}: {exc}")
             continue
     return results
 

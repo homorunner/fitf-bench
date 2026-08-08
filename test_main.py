@@ -233,7 +233,7 @@ class LoadResultsTests(unittest.TestCase):
 
 
 class RunSingleMatchTests(unittest.TestCase):
-    def test_api_error_result_is_not_recorded(self):
+    def test_api_error_keeps_checkpoint_and_records_no_result(self):
         game = FakeGame({
             "winner": None,
             "reason": "api_error",
@@ -245,13 +245,17 @@ class RunSingleMatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch("main.get_game", return_value=game), \
                     patch("main.LLMPlayer"):
-                result = run_single_match(task, directory, directory, False)
+                result = run_single_match(task, directory, directory,
+                                          directory, False)
 
             self.assertIsNone(result)
             result_path = os.path.join(directory, f"{task.match_id}.json")
             self.assertFalse(os.path.exists(result_path))
+            # Checkpoint stays for resume after an infrastructure failure.
+            checkpoint_path = os.path.join(directory, f"{task.match_id}.jsonl")
+            self.assertTrue(os.path.exists(checkpoint_path))
 
-    def test_forfeit_result_is_recorded_as_a_win(self):
+    def test_forfeit_result_is_recorded_and_checkpoint_removed(self):
         game = FakeGame({
             "winner": 1,
             "reason": "forfeit",
@@ -262,12 +266,15 @@ class RunSingleMatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch("main.get_game", return_value=game), \
                     patch("main.LLMPlayer"):
-                result = run_single_match(task, directory, directory, False)
+                result = run_single_match(task, directory, directory,
+                                          directory, False)
 
             self.assertIsNotNone(result)
             result_path = os.path.join(directory, f"{task.match_id}.json")
             with open(result_path, "r", encoding="utf-8") as result_file:
                 recorded = json.load(result_file)
+            checkpoint_path = os.path.join(directory, f"{task.match_id}.jsonl")
+            self.assertFalse(os.path.exists(checkpoint_path))
 
         self.assertEqual(recorded["reason"], "forfeit")
         self.assertEqual(recorded["winner"], 1)
@@ -303,7 +310,8 @@ class RunTournamentTests(unittest.TestCase):
             with patch("main.get_game", return_value=game), \
                     patch("main.LLMPlayer"):
                 completed = main.run_tournament(
-                    scheduler, directory, directory, workers=1, verbose=False
+                    scheduler, directory, directory, directory,
+                    workers=1, verbose=False
                 )
 
             recorded = [f for f in os.listdir(directory)
@@ -311,6 +319,114 @@ class RunTournamentTests(unittest.TestCase):
 
         self.assertEqual(completed, 3)
         self.assertEqual(len(recorded), 3)
+
+
+class CheckpointResumeTests(unittest.TestCase):
+    @staticmethod
+    def _write_checkpoint(directory, match_id, meta_extra=None, actions=()):
+        meta = {
+            "type": "meta",
+            "match_id": match_id,
+            "game_id": "fox-in-the-forest",
+            "model_a": "a",
+            "model_b": "b",
+            "seed": "123",
+        }
+        meta.update(meta_extra or {})
+        path = os.path.join(directory, f"{match_id}.jsonl")
+        with open(path, "w", encoding="utf-8") as checkpoint_file:
+            json.dump(meta, checkpoint_file)
+            checkpoint_file.write("\n")
+            for action in actions:
+                json.dump(action, checkpoint_file)
+                checkpoint_file.write("\n")
+        return path
+
+    def test_healthy_checkpoint_is_resumed_with_replay_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_checkpoint(
+                directory, "match-1",
+                actions=[{"player": 0, "tool": "play_card",
+                          "arguments": {"card": "B3"}, "output_tokens": 10}],
+            )
+
+            tasks = main.load_resumable_tasks(
+                directory, directory, _models("a", "b"), ["fox-in-the-forest"]
+            )
+
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertEqual(task.match_id, "match-1")
+        self.assertEqual(task.seed, "123")
+        self.assertEqual(task.model_a["name"], "a")
+        self.assertEqual(task.model_b["name"], "b")
+        self.assertEqual(task.checkpoint.next_replay()["arguments"],
+                         {"card": "B3"})
+
+    def test_checkpoint_with_removed_model_is_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_checkpoint(
+                directory, "match-1", meta_extra={"model_b": "removed-model"}
+            )
+
+            tasks = main.load_resumable_tasks(
+                directory, directory, _models("a", "b"), ["fox-in-the-forest"]
+            )
+
+            self.assertEqual(tasks, [])
+            self.assertFalse(os.path.exists(path))
+
+    def test_checkpoint_of_finished_match_is_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_checkpoint(directory, "match-1")
+            with open(os.path.join(directory, "match-1.json"), "w",
+                      encoding="utf-8") as result_file:
+                json.dump(_result("a", "b", winner=0), result_file)
+
+            tasks = main.load_resumable_tasks(
+                directory, directory, _models("a", "b"), ["fox-in-the-forest"]
+            )
+
+            self.assertEqual(tasks, [])
+            self.assertFalse(os.path.exists(path))
+
+    def test_corrupt_checkpoint_is_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "broken.jsonl")
+            with open(path, "w", encoding="utf-8") as checkpoint_file:
+                checkpoint_file.write("{not json\n")
+
+            tasks = main.load_resumable_tasks(
+                directory, directory, _models("a", "b"), ["fox-in-the-forest"]
+            )
+
+            self.assertEqual(tasks, [])
+            self.assertFalse(os.path.exists(path))
+
+    def test_resumed_match_finishes_and_removes_checkpoint(self):
+        game = FakeGame({
+            "winner": 0,
+            "reason": "score",
+            "player_names": ["a", "b"],
+            "output_tokens": [0, 0],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_checkpoint(directory, "match-1")
+            tasks = main.load_resumable_tasks(
+                directory, directory, _models("a", "b"), ["fox-in-the-forest"]
+            )
+            self.assertEqual(len(tasks), 1)
+
+            with patch("main.get_game", return_value=game), \
+                    patch("main.LLMPlayer"):
+                result = run_single_match(tasks[0], directory, directory,
+                                          directory, False)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(os.path.exists(
+                os.path.join(directory, "match-1.json")))
+            self.assertFalse(os.path.exists(
+                os.path.join(directory, "match-1.jsonl")))
 
 
 if __name__ == "__main__":

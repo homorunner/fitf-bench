@@ -129,6 +129,7 @@ class ToolProtocolTests(unittest.TestCase):
         player._request_number = 0
         player.total_output_tokens = 0
         player._extra_api_params = {}
+        player.checkpoint = None
         player._captured = captured
         return player
 

@@ -130,7 +130,8 @@ class LLMPlayer:
     def __init__(self, player_id: int, api_base: str, api_key: str, model: str,
                  model_name: Optional[str] = None,
                  game_id: Optional[str] = None, log_path: Optional[str] = None,
-                 extra_api_params: Optional[Dict[str, Any]] = None):
+                 extra_api_params: Optional[Dict[str, Any]] = None,
+                 checkpoint: Optional["MatchCheckpoint"] = None):
         self.player_id = player_id
         # Keep model identities out of prompts and game logs.
         self.player_name = f"Player {player_id + 1}"
@@ -148,6 +149,7 @@ class LLMPlayer:
         self._request_number = 0
         self.total_output_tokens = 0
         self._extra_api_params = extra_api_params or {}
+        self.checkpoint = checkpoint
 
     def reset_for_new_game(self):
         self.messages = []
@@ -284,6 +286,16 @@ class LLMPlayer:
             self._action_description = action_description
             self._retry_lines = []
 
+        if self.checkpoint is not None:
+            replayed = self.checkpoint.next_replay()
+            if replayed is not None:
+                # Restore the token count captured with this action.
+                self.total_output_tokens = max(
+                    self.total_output_tokens,
+                    replayed.get("output_tokens", 0),
+                )
+                return replayed["arguments"], ""
+
         self.messages = self._build_messages(
             self._state_info, self._action_description
         )
@@ -310,6 +322,10 @@ class LLMPlayer:
             return None, ActionError("Invalid JSON in tool arguments.")
         if not isinstance(arguments, dict):
             return None, ActionError("Tool arguments must be a JSON object.")
+
+        if self.checkpoint is not None:
+            self.checkpoint.record(self.player_id, tool_name, arguments,
+                                   self.total_output_tokens)
         return arguments, ""
 
     def request_play_card(self, state_info: Optional[str],

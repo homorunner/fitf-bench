@@ -3,4 +3,5 @@ __pycache__/
 logs/
 results/
 backup/
+checkpoints/
 .env

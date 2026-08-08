@@ -16,6 +16,11 @@ scheduling it; its recorded games still influence other models' ratings.
 Every finished match is written to results/ immediately, so interrupting and
 restarting is always safe: prior results are replayed on startup to restore the
 live ratings.
+
+In-flight matches are checkpointed to checkpoints/ after every successful
+action. On restart, unfinished matches are resumed.
+Checkpoints of finished matches are deleted; checkpoints referencing models no
+longer in MODELS are discarded.
 """
 
 import argparse
@@ -31,11 +36,13 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from fitf_bench import GAMES, LLMPlayer, get_game
+from fitf_bench.checkpoint import MatchCheckpoint
 from initial_elo import DEFAULT_ELO, V1_ELO
 
 MAX_WORKERS = 8
 RESULTS_DIR = "results"
 LOGS_DIR = "logs"
+CHECKPOINTS_DIR = "checkpoints"
 
 # Online Elo K-factor used for the scheduler's live ratings.
 ELO_K = 32.0
@@ -111,12 +118,14 @@ MODELS: List[Dict[str, str]] = [
 
 @dataclass
 class MatchTask:
-    """Describes a single match to be played."""
+    """Describes a single match to be played (or resumed)."""
     model_a: Dict[str, str]
     model_b: Dict[str, str]
     game_id: str
     match_id: str
     seed: str
+    # Checkpoint with recorded actions to replay.
+    checkpoint: Optional[MatchCheckpoint] = None
 
 
 def make_match_id(model_a_name: str, model_b_name: str, game_id: str,
@@ -127,10 +136,23 @@ def make_match_id(model_a_name: str, model_b_name: str, game_id: str,
 
 
 def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
-                     verbose: bool) -> Optional[Dict]:
-    """Run a single match between two models. Returns result dict or None on error."""
+                     checkpoints_dir: str, verbose: bool) -> Optional[Dict]:
+    """Run (or resume) a single match. Returns result dict or None on error."""
     result_path = os.path.join(results_dir, f"{task.match_id}.json")
     log_path = os.path.join(logs_dir, f"{task.match_id}.jsonl")
+    checkpoint_path = os.path.join(checkpoints_dir, f"{task.match_id}.jsonl")
+
+    checkpoint = task.checkpoint
+    if checkpoint is None:
+        checkpoint = MatchCheckpoint.create(checkpoint_path, {
+            "match_id": task.match_id,
+            "game_id": task.game_id,
+            "model_a": task.model_a["name"],
+            "model_b": task.model_b["name"],
+            "seed": task.seed,
+        })
+    else:
+        print(f"[RESUME] {task.match_id}: replaying recorded actions")
 
     player1 = LLMPlayer(
         player_id=0,
@@ -141,6 +163,7 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         game_id=task.game_id,
         log_path=log_path,
         extra_api_params=task.model_a.get("extra_api_params"),
+        checkpoint=checkpoint,
     )
     player2 = LLMPlayer(
         player_id=1,
@@ -151,11 +174,13 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         game_id=task.game_id,
         log_path=log_path,
         extra_api_params=task.model_b.get("extra_api_params"),
+        checkpoint=checkpoint,
     )
 
     game = get_game(task.game_id)
     runner = game.create_runner(
-        player1, player2, verbose=verbose, seed=task.seed
+        player1, player2, verbose=verbose, seed=task.seed,
+        results_dir=results_dir,
     )
 
     try:
@@ -165,10 +190,11 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
         return None
 
     if result.get("reason") == "api_error":
-        # Infrastructure failure: nobody's fault, don't record.
+        # Infrastructure failure: nobody's fault, don't record the result.
+        # Keep the checkpoint so the match resumes on the next run.
         failed = result["player_names"][result["api_error_player"]]
         print(f"[ABORT] {task.match_id}: repeated API errors for {failed} "
-              f"(not recorded)")
+              f"(not recorded, checkpoint kept for resume)")
         return None
 
     # Enrich result with tournament metadata
@@ -179,9 +205,10 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
     result["game_id"] = task.game_id
     result["timestamp"] = time.time()
 
-    # Write result
+    # Write result, then drop the checkpoint (match is durably recorded).
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
+    checkpoint.delete()
 
     winner_name = result["player_names"][result["winner"]]
     score_text = ""
@@ -191,6 +218,41 @@ def run_single_match(task: MatchTask, results_dir: str, logs_dir: str,
           f"({result['reason']})")
 
     return result
+
+
+def load_resumable_tasks(checkpoints_dir: str, results_dir: str,
+                         models: List[Dict[str, str]],
+                         game_ids: List[str]) -> List[MatchTask]:
+    """Scan checkpoints/ for healthy half-finished matches to resume."""
+    if not os.path.isdir(checkpoints_dir):
+        return []
+    models_by_name = {m["name"]: m for m in models}
+    tasks = []
+    for filename in sorted(os.listdir(checkpoints_dir)):
+        if not filename.endswith(".jsonl"):
+            continue
+        path = os.path.join(checkpoints_dir, filename)
+        meta, checkpoint = MatchCheckpoint.load(path)
+        match_id = (meta or {}).get("match_id")
+        model_a = models_by_name.get((meta or {}).get("model_a"))
+        model_b = models_by_name.get((meta or {}).get("model_b"))
+        game_id = (meta or {}).get("game_id")
+        usable = (match_id and model_a and model_b and game_id in game_ids
+                  and (meta or {}).get("seed") is not None)
+        already_done = match_id and os.path.exists(
+            os.path.join(results_dir, f"{match_id}.json"))
+        if not usable or already_done:
+            checkpoint.delete()
+            continue
+        tasks.append(MatchTask(
+            model_a=model_a,
+            model_b=model_b,
+            game_id=game_id,
+            match_id=match_id,
+            seed=meta["seed"],
+            checkpoint=checkpoint,
+        ))
+    return tasks
 
 
 # ===========================================================================
@@ -228,7 +290,8 @@ def load_all_results(results_dir: str) -> List[Dict]:
                 data = json.load(f)
             order = data.get("timestamp") or os.path.getmtime(filepath)
             entries.append((order, data))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[WARN] Skipping unreadable result {filepath}: {exc}")
             continue
     entries.sort(key=lambda pair: pair[0])
     return [data for _, data in entries]
@@ -340,6 +403,15 @@ class MatchScheduler:
                 seed=seed,
             )
 
+    def register_in_flight(self, task: MatchTask):
+        """Count an externally created task (e.g. resumed from a checkpoint)
+        toward the in-flight pair/game counters so matchmaking stays balanced
+        and finish_match stays symmetric."""
+        with self._lock:
+            pair = self._pair_key(task.model_a["name"], task.model_b["name"])
+            self.in_flight_pairs[pair] += 1
+            self.in_flight_games[task.game_id] += 1
+
     def finish_match(self, task: MatchTask, result: Optional[Dict]):
         with self._lock:
             pair = self._pair_key(task.model_a["name"], task.model_b["name"])
@@ -411,16 +483,23 @@ def print_summary(results_dir: str, models: List[Dict[str, str]], game_id: str):
 
 
 def run_tournament(scheduler: MatchScheduler, results_dir: str, logs_dir: str,
-                   workers: int, verbose: bool) -> int:
+                   checkpoints_dir: str, workers: int, verbose: bool,
+                   resume_tasks: Optional[List[MatchTask]] = None) -> int:
     completed = 0
     executor = ThreadPoolExecutor(max_workers=workers)
     futures: Dict = {}
+    pending_resume = list(resume_tasks or [])
     try:
         while True:
             while len(futures) < workers:
-                task = scheduler.sample_match()
+                if pending_resume:
+                    task = pending_resume.pop(0)
+                    scheduler.register_in_flight(task)
+                else:
+                    task = scheduler.sample_match()
                 future = executor.submit(
-                    run_single_match, task, results_dir, logs_dir, verbose
+                    run_single_match, task, results_dir, logs_dir,
+                    checkpoints_dir, verbose
                 )
                 futures[future] = task
                 print(f"[MATCH] {task.match_id} "
@@ -442,8 +521,8 @@ def run_tournament(scheduler: MatchScheduler, results_dir: str, logs_dir: str,
                         print(scheduler.format_standings() + "\n")
     except KeyboardInterrupt:
         print(f"\n[INTERRUPT] Stopping: no new matches will be scheduled. "
-              f"{len(futures)} match(es) still in flight are abandoned; "
-              f"completed matches are already saved and will be picked up on restart.")
+              f"{len(futures)} match(es) still in flight are checkpointed "
+              f"and will be resumed on the next run.")
         executor.shutdown(wait=False, cancel_futures=True)
     return completed
 
@@ -460,6 +539,9 @@ def main():
                         help=f"Results directory (default: {RESULTS_DIR})")
     parser.add_argument("--logs-dir", type=str, default=LOGS_DIR,
                         help=f"Logs directory (default: {LOGS_DIR})")
+    parser.add_argument("--checkpoints-dir", type=str, default=CHECKPOINTS_DIR,
+                        help=f"Checkpoints directory for resuming half-finished "
+                             f"matches (default: {CHECKPOINTS_DIR})")
     parser.add_argument("--seed", type=int, default=1437,
                         help="Random seed for the matchmaking sampler")
     parser.add_argument("--verbose", action="store_true",
@@ -471,8 +553,10 @@ def main():
 
     results_dir = os.path.abspath(args.results_dir)
     logs_dir = os.path.abspath(args.logs_dir)
+    checkpoints_dir = os.path.abspath(args.checkpoints_dir)
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
+    os.makedirs(checkpoints_dir, exist_ok=True)
 
     selected_games = [args.game] if args.game else list(GAMES)
 
@@ -486,6 +570,13 @@ def main():
         print(f"[RESUME] Replayed {len(prior_results)} prior result(s) "
               f"to restore live ratings.")
 
+    resume_tasks = load_resumable_tasks(
+        checkpoints_dir, results_dir, MODELS, selected_games
+    )
+    if resume_tasks:
+        print(f"[RESUME] Found {len(resume_tasks)} half-finished match(es) "
+              f"to resume from checkpoints.")
+
     scheduler = MatchScheduler(
         MODELS, selected_games, prior_results,
         rng=random.Random(args.seed),
@@ -495,8 +586,9 @@ def main():
           f"Press Ctrl+C to stop.\n")
 
     completed = run_tournament(
-        scheduler, results_dir, logs_dir,
+        scheduler, results_dir, logs_dir, checkpoints_dir,
         workers=args.workers, verbose=args.verbose,
+        resume_tasks=resume_tasks,
     )
 
     print(f"\n[COMPLETE] {completed} match(es) finished this run.")

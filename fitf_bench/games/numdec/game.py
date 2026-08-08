@@ -177,7 +177,8 @@ class NumberDecompositionRunner(TwoPlayerGameRunner):
             try:
                 with open(path, "r", encoding="utf-8") as result_file:
                     data = json.load(result_file)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError) as exc:
+                print(f"[WARN] Skipping unreadable result {path}: {exc}")
                 continue
             if data.get("game_id") != self.game_id:
                 continue
